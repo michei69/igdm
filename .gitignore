@@ -1,0 +1,18 @@
+# Rust
+/target
+
+# Tauri generated schema
+crates/igdm/gen/
+
+# Frontend (crates/igdm/ui)
+crates/igdm/ui/node_modules/
+crates/igdm/ui/dist/
+crates/igdm/ui/test-results/
+crates/igdm/ui/playwright-report/
+
+# Root tooling
+node_modules/
+
+# bun install cache / temp dirs
+.bun-install/
+.bun-tmp/

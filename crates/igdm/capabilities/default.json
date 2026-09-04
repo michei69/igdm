@@ -1,0 +1,17 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default capabilities for the IG Direct windows",
+  "windows": ["main", "settings"],
+  "permissions": [
+    "core:default",
+    "core:webview:allow-create-webview-window",
+    "core:window:allow-set-focus",
+    "core:window:allow-show",
+    "core:window:allow-center",
+    "dialog:default",
+    "opener:default",
+    "clipboard-manager:allow-write-text",
+    "notification:default"
+  ]
+}

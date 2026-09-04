@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = ["crates/instagrapi", "crates/igdm"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "io-util", "sync", "macros"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+log = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+rand = "0.8"
+base64 = "0.22"
+sha2 = "0.10"
+flate2 = "1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+percent-encoding = "2"
+futures-util = "0.3"
+
+# tao 0.36.0 fixes forced client-side decorations on Wayland
+# (tao-apps/tao#1046, tauri#12955, tauri#12685), but tauri 2.11.5 pins
+# tao = "0.35". Vendor the 0.35.3 tree with the upstream 0.36.0 window.rs
+# change applied. Remove once tauri >= 2.12 (tao 0.36) is released.
+[patch.crates-io]
+tao = { path = "vendor/tao" }
+
+[profile.release]
+lto = true

@@ -1,0 +1,18 @@
+{
+  "name": "igdm",
+  "private": true,
+  "version": "0.1.0",
+  "description": "IG Direct — Instagram DM desktop client (Tauri 2 + React)",
+  "scripts": {
+    "dev": "cd crates/igdm && tauri dev",
+    "build": "cd crates/igdm && tauri build",
+    "run": "cargo run -p igdm",
+    "typecheck": "bun --cwd crates/igdm/ui run typecheck",
+    "doctor": "bun --cwd crates/igdm/ui run doctor",
+    "frontend:install": "bun --cwd crates/igdm/ui install",
+    "frontend:build": "bun --cwd crates/igdm/ui run build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4"
+  }
+}
