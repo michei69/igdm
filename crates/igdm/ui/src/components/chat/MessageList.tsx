@@ -21,7 +21,7 @@ import {
 } from "../../lib/attachment";
 import { emojiDisplay } from "../../lib/format";
 import { copyClipboard } from "../../lib/clipboard";
-import { senderOf, type Row } from "../../lib/buildRows";
+import { senderOf, type MsgRow } from "../../lib/buildRows";
 import { threadWithReaction, toggleReaction } from "../../lib/reactions";
 import MessageRow from "./MessageRow";
 import DateSeparator from "../common/DateSeparator";
@@ -84,8 +84,8 @@ export default function MessageList({ onPreview, onShare }: Props) {
   }, [state.replyScroll, rows, virtualizer, setReplyScroll]);
 
   const onMedia = useCallback(
-    (msg: DirectMessage) => {
-      const att = attachmentFromMsg(msg);
+    (row: MsgRow) => {
+      const att = attachmentFromMsg(row.msg);
       if (!att) return;
       // Reel, feed and story shares open the detail modal (download + open in
       // web); only older share shapes fall through to the browser.
@@ -115,23 +115,27 @@ export default function MessageList({ onPreview, onShare }: Props) {
   );
 
   const onDoubleClickMsg = useCallback(
-    (msg: DirectMessage) => {
+    (row: MsgRow) => {
       if (!ts || openKey?.startsWith("user:")) return;
       const emoji = state.reactionEmojis[0];
       if (!emoji) return;
-      handleReaction(msg, emoji);
+      handleReaction(row.msg, emoji);
     },
     [ts, openKey, state.reactionEmojis, handleReaction],
   );
 
   const onReplyClick = useCallback(
-    (row: Row) => {
-      if (row.kind === "msg" && row.replyTarget && ts) {
+    (row: MsgRow) => {
+      if (row.replyTarget && ts) {
         huntReply(ts, row.replyTarget);
       }
     },
     [ts, huntReply],
   );
+
+  const onMenuRow = useCallback((x: number, y: number, row: MsgRow) => {
+    menuHostRef.current?.open(x, y, row.msg);
+  }, []);
 
   if (!ts) return null;
 
@@ -223,11 +227,11 @@ export default function MessageList({ onPreview, onShare }: Props) {
                   style={itemStyle}
                 >
                   <MessageRow
-                    view={view}
-                    onMedia={() => onMedia(row.msg)}
-                    onMenu={(x, y) => menuHostRef.current?.open(x, y, row.msg)}
-                    onReplyClick={() => onReplyClick(row)}
-                    onDoubleClick={() => onDoubleClickMsg(row.msg)}
+                    row={row}
+                    onMedia={onMedia}
+                    onMenu={onMenuRow}
+                    onReplyClick={onReplyClick}
+                    onDoubleClick={onDoubleClickMsg}
                   />
                 </div>
               );

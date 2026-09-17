@@ -7,10 +7,18 @@ import { mediaLabel, messagePreview, reactionDetails, reactionsText } from "./fo
 import { type Json, type JsonObject } from "./guards";
 import type { MessageView } from "../components/chat/MessageRow";
 
+export type MsgRow = {
+  kind: "msg";
+  key: string;
+  view: MessageView;
+  msg: DirectMessage;
+  replyTarget: string | null;
+};
+
 export type Row =
   | { kind: "hint"; key: string; loading: boolean }
   | { kind: "day"; key: string; when: Date }
-  | { kind: "msg"; key: string; view: MessageView; msg: DirectMessage; replyTarget: string | null };
+  | MsgRow;
 
 /** Display-name resolution shared by `senderOf` and reaction names. */
 function resolveName(

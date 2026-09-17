@@ -177,48 +177,49 @@ export function AppProvider({ children }: { children: ReactNode }) {
       for (const effect of result.effects) {
         runEffect(effect);
       }
-    }).then((u) => {
-      if (disposed) {
-        u();
-        return;
-      }
-      unlistenEvents = u;
-      // Events are flowing now, so a resume that emits LoggedIn/LoginError is
-      // guaranteed to reach the reducer.
-      api
-        .getBootstrap()
-        .then((b) => {
-          if (disposed) return;
-          setState((s) => ({
-            ...s,
-            savedSessions: b.saved_sessions,
-            reactionEmojis: b.reaction_emojis.length === 5 ? b.reaction_emojis : s.reactionEmojis,
-            chatThemesEnabled: b.chat_themes,
-          }));
-          if (isTheme(b.theme)) applyTheme(b.theme);
-          // Resume the most recently-used saved session (the backend returns
-          // `saved_sessions` most-recent-first) so the login screen is skipped
-          // when the user was still logged in on close. A failed resume
-          // (expired session) or a 2FA prompt falls back to `login` via the
-          // reducer; an empty session list shows the login form directly.
-          const last = b.saved_sessions[0];
-          if (last) {
-            if (!autoLoginRef.current) {
-              autoLoginRef.current = true;
-              loginSaved(last);
-            }
-          } else {
-            setState((s) => ({ ...s, screen: "login" }));
-          }
-        })
-        .catch((err) => {
-          console.error(
-            "bootstrap failed: saved sessions, reaction emojis, and theme were not loaded",
-            err,
-          );
-          if (!disposed) setState((s) => ({ ...s, screen: "login" }));
-        });
     })
+      .then((u) => {
+        if (disposed) {
+          u();
+          return;
+        }
+        unlistenEvents = u;
+        // Events are flowing now, so a resume that emits LoggedIn/LoginError is
+        // guaranteed to reach the reducer.
+        api
+          .getBootstrap()
+          .then((b) => {
+            if (disposed) return;
+            setState((s) => ({
+              ...s,
+              savedSessions: b.saved_sessions,
+              reactionEmojis: b.reaction_emojis.length === 5 ? b.reaction_emojis : s.reactionEmojis,
+              chatThemesEnabled: b.chat_themes,
+            }));
+            if (isTheme(b.theme)) applyTheme(b.theme);
+            // Resume the most recently-used saved session (the backend returns
+            // `saved_sessions` most-recent-first) so the login screen is skipped
+            // when the user was still logged in on close. A failed resume
+            // (expired session) or a 2FA prompt falls back to `login` via the
+            // reducer; an empty session list shows the login form directly.
+            const last = b.saved_sessions[0];
+            if (last) {
+              if (!autoLoginRef.current) {
+                autoLoginRef.current = true;
+                loginSaved(last);
+              }
+            } else {
+              setState((s) => ({ ...s, screen: "login" }));
+            }
+          })
+          .catch((err) => {
+            console.error(
+              "bootstrap failed: saved sessions, reaction emojis, and theme were not loaded",
+              err,
+            );
+            if (!disposed) setState((s) => ({ ...s, screen: "login" }));
+          });
+      })
       .catch((err) => {
         // If the event channel can't be established, don't hang the boot
         // splash — surface the login screen instead.

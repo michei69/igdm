@@ -80,16 +80,16 @@ fn log_mark_seen_raw(label: &str, raw: Option<&Value>) {
 /// Log any message whose item type the app can't render, with its raw JSON.
 fn log_unhandled_messages(source: &str, messages: &[DirectMessage]) {
     for msg in messages {
-        let Some(item_type) = msg.item_type.as_deref() else { continue };
+        let Some(item_type) = msg.item_type.as_deref() else {
+            continue;
+        };
         if is_known_item_type(item_type) {
             continue;
         }
         let raw = msg
             .raw
             .as_ref()
-            .map(|v| {
-                serde_json::to_string(v).unwrap_or_else(|_| "<unserializable>".to_string())
-            })
+            .map(|v| serde_json::to_string(v).unwrap_or_else(|_| "<unserializable>".to_string()))
             .unwrap_or_else(|| "<no raw>".to_string());
         log::debug!("[igdm] unhandled {source} message type {item_type:?}: {raw}");
     }
@@ -110,10 +110,8 @@ fn write_temp_media(what: &str, data: &[u8], ext: &str) -> std::result::Result<P
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let path = std::env::temp_dir().join(format!(
-        "igdm-media-{}-{nonce}.{ext}",
-        std::process::id()
-    ));
+    let path =
+        std::env::temp_dir().join(format!("igdm-media-{}-{nonce}.{ext}", std::process::id()));
     std::fs::write(&path, data).map_err(|e| format!("Could not write {what}: {e}"))?;
     Ok(path)
 }
@@ -144,7 +142,9 @@ async fn transcode_to_m4a(input: &Path) -> std::result::Result<PathBuf, String> 
             log::warn!("ffmpeg not found; sending recorded mp4 voice as-is (server may reject it)");
             return Ok(input.to_path_buf());
         }
-        return Err("Voice messages need ffmpeg installed to convert the recording to m4a".to_string());
+        return Err(
+            "Voice messages need ffmpeg installed to convert the recording to m4a".to_string(),
+        );
     }
     let output = input.with_extension("m4a");
     let status = tokio::process::Command::new("ffmpeg")
@@ -263,7 +263,9 @@ impl Service {
                     .collect()
             })
             .unwrap_or_default();
-        files.sort_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+        // `sort_by_cached_key` evaluates the key once per file; `sort_by_key`
+        // would issue a `metadata` syscall on every comparison.
+        files.sort_by_cached_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
         files.reverse();
         files
     }
@@ -489,7 +491,9 @@ impl Service {
         let svc = self.clone();
         rt.on("reaction", move |payload| svc.on_reaction(payload));
         let svc = self.clone();
-        rt.on("send_response", move |payload| svc.on_send_response(payload));
+        rt.on("send_response", move |payload| {
+            svc.on_send_response(payload)
+        });
         let svc = self.clone();
         rt.on("typing", move |payload| svc.on_typing(payload));
         let svc = self.clone();
@@ -674,7 +678,11 @@ impl Service {
             return;
         }
 
-        let item_id = if dm.id.is_empty() { item_id } else { dm.id.clone() };
+        let item_id = if dm.id.is_empty() {
+            item_id
+        } else {
+            dm.id.clone()
+        };
         // `LiveMessage.text` and `message.text` are independent owned fields
         // both consumed by the frontend — the text value is duplicated once.
         let text = dm.text.clone();
@@ -971,7 +979,10 @@ impl Service {
     /// One page of comments for a media item (`media/{pk}/comments/`);
     /// `max_id` paginates.
     pub async fn media_comments(&self, media_id: &str, max_id: Option<String>) -> Option<Value> {
-        self.client.media_comments(media_id, max_id.as_deref()).await.ok()
+        self.client
+            .media_comments(media_id, max_id.as_deref())
+            .await
+            .ok()
     }
 
     /// One story item (playable video included) by pk, resolved from the
@@ -987,10 +998,13 @@ impl Service {
         let value = self.fetch_thread_raw(thread_id).await.ok()?;
         let thread = value.get("thread")?;
         let items = thread.get("items")?.as_array()?;
-        items.iter().find(|it| {
-            it.get("item_id").and_then(|v| v.as_str()) == Some(item_id)
-                || it.get("id").and_then(|v| v.as_str()) == Some(item_id)
-        }).cloned()
+        items
+            .iter()
+            .find(|it| {
+                it.get("item_id").and_then(|v| v.as_str()) == Some(item_id)
+                    || it.get("id").and_then(|v| v.as_str()) == Some(item_id)
+            })
+            .cloned()
     }
 
     /// Raw thread JSON for the "copy raw data" menu: the raw API response
@@ -1088,7 +1102,9 @@ impl Service {
             match svc.messages_page(&thread_id, amount, None).await {
                 Ok((messages, cursor, has_more)) => {
                     log_unhandled_messages("history", &messages);
-                    svc.emit(AppEvent::MessagesLoaded(thread_id, messages, cursor, has_more));
+                    svc.emit(AppEvent::MessagesLoaded(
+                        thread_id, messages, cursor, has_more,
+                    ));
                 }
                 Err(e) => {
                     svc.emit(AppEvent::SendFailed(
@@ -1150,10 +1166,7 @@ impl Service {
         text: Option<&str>,
         thread_id: Option<&str>,
     ) {
-        let real_thread_id = msg
-            .thread_id
-            .clone()
-            .unwrap_or_else(|| key.clone());
+        let real_thread_id = msg.thread_id.clone().unwrap_or_else(|| key.clone());
         Self::patch_sent(&mut msg, text, thread_id, viewer);
         self.emit(AppEvent::Sent {
             key,
@@ -1190,7 +1203,13 @@ impl Service {
             };
             match result {
                 Ok(msg) => {
-                    svc.emit_sent(thread_id.clone(), msg, &viewer, Some(&text), Some(&thread_id));
+                    svc.emit_sent(
+                        thread_id.clone(),
+                        msg,
+                        &viewer,
+                        Some(&text),
+                        Some(&thread_id),
+                    );
                 }
                 Err(e) => svc.emit(AppEvent::SendFailed(thread_id, err_text(&e))),
             }
@@ -1241,7 +1260,10 @@ impl Service {
             .await
             .map(|i| i.to_string())
             .unwrap_or_default();
-        log::debug!("[igdm] send_photo: start (thread {thread_id}, file {})", path.display());
+        log::debug!(
+            "[igdm] send_photo: start (thread {thread_id}, file {})",
+            path.display()
+        );
         match self
             .client
             .direct_send_photo(&path, &[thread_id.as_str()])
@@ -1368,7 +1390,9 @@ impl Service {
             // topic 146 regardless.
             if !item_id.is_empty() {
                 if let Err(e) = svc.client.direct_message_seen(&thread_id, &item_id).await {
-                    log::error!("[igdm] mark_seen failed (thread {thread_id}, item {item_id}): {e}");
+                    log::error!(
+                        "[igdm] mark_seen failed (thread {thread_id}, item {item_id}): {e}"
+                    );
                     log_mark_seen_raw("mark_seen", raw.as_ref());
                 }
             }
@@ -1388,7 +1412,9 @@ impl Service {
                 Some(_) => log::debug!(
                     "[igdm] typing dropped: realtime not connected (thread {thread_id})"
                 ),
-                None => log::debug!("[igdm] typing dropped: no realtime client (thread {thread_id})"),
+                None => {
+                    log::debug!("[igdm] typing dropped: no realtime client (thread {thread_id})")
+                }
             }
         });
     }
@@ -1493,5 +1519,7 @@ fn theme_from(map: &Map<String, Value>) -> String {
 
 /// Chat-themes toggle from a parsed settings map (default: on).
 fn chat_themes_from(map: &Map<String, Value>) -> bool {
-    map.get("chat_themes").and_then(|v| v.as_bool()).unwrap_or(true)
+    map.get("chat_themes")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
 }

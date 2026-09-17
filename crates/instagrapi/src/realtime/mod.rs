@@ -163,7 +163,7 @@ fn tls_config() -> &'static Arc<rustls::ClientConfig> {
 /// through one mutex so the reader task and UI publishes serialize.
 pub struct RealtimeClient {
     client: Client,
-    transport: Mutex<Option<Transport>>,
+    transport: Mutex<Option<Arc<Transport>>>,
     handlers: std::sync::Mutex<HashMap<String, Vec<Handler>>>,
     connected: std::sync::atomic::AtomicBool,
     packet_id: std::sync::atomic::AtomicU16,
@@ -211,7 +211,8 @@ impl RealtimeClient {
     }
 
     pub async fn connect(&self) -> Result<()> {
-        let mut transport = self.transport.lock().await;
+        // The TCP/TLS handshake and CONNACK wait happen outside the lock so a
+        // slow connect never blocks other traffic or a reconnect attempt.
         let t = Transport::connect(REALTIME_HOST, 443).await?;
         let connection = self.build_connection().await?;
         let packet = write_connect_packet(&connection, 20);
@@ -224,7 +225,7 @@ impl RealtimeClient {
                 decoded.return_code
             )));
         }
-        *transport = Some(t);
+        *self.transport.lock().await = Some(Arc::new(t));
         self.connected
             .store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(())
@@ -233,20 +234,19 @@ impl RealtimeClient {
     pub async fn disconnect(&self) {
         self.connected
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        let mut transport = self.transport.lock().await;
-        if let Some(t) = transport.as_ref() {
+        let transport = self.transport.lock().await.take();
+        if let Some(t) = transport {
             let _ = t.send(&write_disconnect_packet()).await;
             let _ = t.close().await;
         }
-        *transport = None;
     }
 
     /// Close the socket without a DISCONNECT (used to unblock the reader).
     pub async fn shutdown_transport(&self) {
         self.connected
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        let transport = self.transport.lock().await;
-        if let Some(t) = transport.as_ref() {
+        let transport = self.transport.lock().await.clone();
+        if let Some(t) = transport {
             let _ = t.close().await;
         }
     }
@@ -339,8 +339,9 @@ impl RealtimeClient {
 
     /// `direct_subscribe` — fetch the inbox seq state, then subscribe via IRIS.
     pub async fn direct_subscribe(&self) -> Result<Map<String, Value>> {
-        let threads = self.client.direct_threads(1).await?;
-        let _ = threads;
+        // Side effect only: the fetch populates `last_json` with the inbox's
+        // realtime sync state (`seq_id`, `snapshot_at_ms`).
+        self.client.direct_threads(1).await?;
         let last_json = self.client.state().await.last_json.clone();
         let seq_id = last_json.get("seq_id").cloned();
         let snapshot_at_ms = last_json.get("snapshot_at_ms").cloned();
@@ -407,8 +408,11 @@ impl RealtimeClient {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             + 1;
         let packet = write_publish_packet(topic, payload, 1, id);
-        let transport = self.transport.lock().await;
-        match transport.as_ref() {
+        // Clone the transport out so an in-flight read (which may idle for up
+        // to its 30s timeout) never delays a publish; socket writes serialize
+        // on the transport's own write mutex.
+        let transport = self.transport.lock().await.clone();
+        match transport {
             Some(t) => t.send(&packet).await,
             None => Err(IgError::new(
                 crate::error::ErrorKind::MqttNotConnected,
@@ -425,8 +429,8 @@ impl RealtimeClient {
             ));
         }
         {
-            let transport = self.transport.lock().await;
-            if let Some(t) = transport.as_ref() {
+            let transport = self.transport.lock().await.clone();
+            if let Some(t) = transport {
                 t.send(&write_pingreq_packet()).await?;
             }
         }
@@ -443,8 +447,10 @@ impl RealtimeClient {
 
     /// Read one packet and dispatch it (returns the packet kind for ping).
     pub async fn read_once(&self) -> Result<Option<String>> {
-        let transport = self.transport.lock().await;
-        let Some(t) = transport.as_ref() else {
+        // Clone the transport out: the idle wait for the next packet must not
+        // hold the client-wide lock (that would stall every publish).
+        let transport = self.transport.lock().await.clone();
+        let Some(t) = transport else {
             return Err(IgError::new(
                 crate::error::ErrorKind::MqttNotConnected,
                 "Realtime client is not connected",
@@ -681,9 +687,9 @@ fn thread_id_from_path(path: &str) -> Option<String> {
 /// anywhere in the tree (matches the previous whole-object `to_string`).
 fn value_contains_text(value: &Value, needle: &str) -> bool {
     match value {
-        Value::Object(o) => o.iter().any(|(k, v)| {
-            k.to_lowercase().contains(needle) || value_contains_text(v, needle)
-        }),
+        Value::Object(o) => o
+            .iter()
+            .any(|(k, v)| k.to_lowercase().contains(needle) || value_contains_text(v, needle)),
         Value::Array(a) => a.iter().any(|v| value_contains_text(v, needle)),
         Value::String(s) => s.to_lowercase().contains(needle),
         _ => false,
@@ -715,10 +721,7 @@ fn direct_realtime_event_kind(event: &Value) -> Option<&'static str> {
     if path.contains("/reactions/") {
         return Some("reaction");
     }
-    if path.contains("presence")
-        || value_has("is_active")
-        || value_has("last_active")
-    {
+    if path.contains("presence") || value_has("is_active") || value_has("last_active") {
         return Some("presence");
     }
     if action == "mark_seen"

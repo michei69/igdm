@@ -12,6 +12,9 @@ const ESTIMATED_MESSAGE_HEIGHT = 72;
  * longer yanks the user down. */
 const STICK_EPSILON = 8;
 
+/** Distance from the bottom beyond which the jump-to-bottom button shows. */
+const JUMP_DIST = 160;
+
 interface UseMessageListVirtualizationProps {
   ts: ThreadState | undefined;
   meId: string;
@@ -26,8 +29,9 @@ export function useMessageListVirtualization({
   loadOlder,
 }: UseMessageListVirtualizationProps) {
   const scrollElRef = useRef<HTMLDivElement | null>(null);
-  const [scrollTop, setScrollTop] = useState(0);
   const [viewH, setViewH] = useState(0);
+  const [showJump, setShowJump] = useState(false);
+  const showJumpRef = useRef(false);
   const stickRef = useRef(true);
   const scrollMemory = useRef<Map<string, { offset: number; stick: boolean }>>(new Map());
   const prevKey = useRef("");
@@ -52,7 +56,21 @@ export function useMessageListVirtualization({
   });
 
   const totalSize = virtualizer.getTotalSize();
-  const bottomDist = Math.max(0, totalSize - (scrollTop + viewH));
+
+  // The jump button is the only scroll-derived value kept in React state: the
+  // raw offset is never rendered, so a setState per scroll frame would
+  // re-render the whole list for nothing.
+  const updateJump = useCallback((el: HTMLElement) => {
+    const jump = el.scrollHeight - el.scrollTop - el.clientHeight > JUMP_DIST;
+    if (showJumpRef.current !== jump) {
+      showJumpRef.current = jump;
+      setShowJump(jump);
+    }
+  }, []);
+
+  // The scroll listener is bound once; it reaches the latest load-older
+  // guard through a ref instead of re-binding on every `ts` change.
+  const loadOlderRef = useRef<() => void>(() => {});
 
   // Viewport height + scroll tracking. Stick intent is set ONLY by real
   // scrolls: content growth (a new message, a reaction growing the last row)
@@ -65,16 +83,17 @@ export function useMessageListVirtualization({
     ro.observe(el);
     setViewH(el.clientHeight);
     const onScroll = () => {
-      setScrollTop(el.scrollTop);
       const dist = el.scrollHeight - el.scrollTop - el.clientHeight;
       stickRef.current = dist <= STICK_EPSILON;
+      updateJump(el);
+      loadOlderRef.current();
     };
     el.addEventListener("scroll", onScroll, { passive: true });
     return () => {
       ro.disconnect();
       el.removeEventListener("scroll", onScroll);
     };
-  }, []);
+  }, [updateJump]);
 
   // Per-thread scroll memory: save outgoing position, restore on return. A
   // layout effect so `pendingRestore` is set before the pin effect below.
@@ -161,10 +180,15 @@ export function useMessageListVirtualization({
   }, [ts, loadOlder]);
 
   useEffect(() => {
-    loadOlderIfNeeded();
-  }, [scrollTop, loadOlderIfNeeded]);
+    loadOlderRef.current = loadOlderIfNeeded;
+  }, [loadOlderIfNeeded]);
 
-  const showJump = bottomDist > 160;
+  // Content growth and resizes move the bottom distance without a scroll
+  // event (new message, media loading, window resize): refresh the button.
+  useEffect(() => {
+    const el = scrollElRef.current;
+    if (el) updateJump(el);
+  }, [rows, totalSize, viewH, updateJump]);
 
   return {
     scrollElRef,

@@ -244,11 +244,7 @@ function clipFromXma(x: XmaShare): Attachment | null {
 /** First `generic_xma` item with a `preview_url`. The unfiltered `raw_xma`
  * copy is checked first — it survives items the extractor prunes. */
 function firstGenericXma(msg: DirectMessage): XmaItem | null {
-  return (
-    firstPreview(msg.raw_xma?.generic_xma) ??
-    firstPreview(msg.generic_xma) ??
-    null
-  );
+  return firstPreview(msg.raw_xma?.generic_xma) ?? firstPreview(msg.generic_xma) ?? null;
 }
 
 /** Build the `generic_xma` attachment. A non-null `sticker_type` marks a

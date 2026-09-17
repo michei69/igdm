@@ -149,14 +149,6 @@ pub fn try_decompress_payload(data: &[u8]) -> Cow<'_, [u8]> {
     }
 }
 
-fn write_utf8(value: &str) -> Vec<u8> {
-    let raw = value.as_bytes();
-    let mut out = Vec::with_capacity(2 + raw.len());
-    out.extend_from_slice(&(raw.len() as u16).to_be_bytes());
-    out.extend_from_slice(raw);
-    out
-}
-
 fn encode_remaining_length(value: usize) -> Vec<u8> {
     let mut encoded = Vec::new();
     let mut v = value;
@@ -174,7 +166,10 @@ fn encode_remaining_length(value: usize) -> Vec<u8> {
 }
 
 /// MQTT remaining-length varint (max 4 bytes per spec).
-pub(crate) fn decode_remaining_length(data: &[u8], offset: usize) -> Result<(usize, usize), String> {
+pub(crate) fn decode_remaining_length(
+    data: &[u8],
+    offset: usize,
+) -> Result<(usize, usize), String> {
     let mut multiplier = 1usize;
     let mut value = 0usize;
     let mut pos = offset;
@@ -219,16 +214,6 @@ pub fn write_publish_packet(topic: &str, payload: &[u8], qos: u8, packet_id: u16
         packet.extend_from_slice(&packet_id.to_be_bytes());
     }
     packet.extend_from_slice(payload);
-    packet
-}
-
-pub fn write_subscribe_packet(topic: &str, packet_id: u16, qos: u8) -> Vec<u8> {
-    let mut body = packet_id.to_be_bytes().to_vec();
-    body.extend_from_slice(&write_utf8(topic));
-    body.push(qos);
-    let mut packet = vec![0x82];
-    packet.extend_from_slice(&encode_remaining_length(body.len()));
-    packet.extend_from_slice(&body);
     packet
 }
 

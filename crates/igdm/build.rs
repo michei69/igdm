@@ -16,9 +16,11 @@ fn build_frontend_if_missing() {
     if index.exists() {
         return;
     }
-    eprintln!("[igdm] frontend build missing — running `npm --prefix ui run build`");
-    let ok = std::process::Command::new("npm")
-        .args(["--prefix", "ui", "run", "build"])
+    // The project is bun-only (bun.lock, bun scripts); use the same tool the
+    // root package.json scripts call (`bun --cwd <dir> run <script>`).
+    eprintln!("[igdm] frontend build missing — running `bun --cwd ui run build`");
+    let ok = std::process::Command::new("bun")
+        .args(["--cwd", "ui", "run", "build"])
         .current_dir(&manifest)
         .status()
         .map(|s| s.success())
@@ -26,7 +28,7 @@ fn build_frontend_if_missing() {
     if !ok {
         eprintln!(
             "[igdm] WARNING: frontend build failed; cargo run / tauri build will fail \
-             on missing web assets (run `npm --prefix crates/igdm/ui install` first)"
+             on missing web assets (run `bun --cwd crates/igdm/ui install` first)"
         );
     }
 }
