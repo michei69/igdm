@@ -2,6 +2,7 @@ import { memo, useMemo } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import Linkify from "linkify-react";
 import type { Attachment } from "../../lib/attachment";
+import type { MsgRow } from "../../lib/buildRows";
 import Avatar from "../common/Avatar";
 import { useRemoteImage } from "../../hooks/useRemoteImage";
 import VoicePlayer from "./VoicePlayer";
@@ -31,11 +32,11 @@ export interface MessageView {
 }
 
 interface Props {
-  view: MessageView;
-  onMedia: () => void;
-  onMenu: (x: number, y: number) => void;
-  onReplyClick: () => void;
-  onDoubleClick: () => void;
+  row: MsgRow;
+  onMedia: (row: MsgRow) => void;
+  onMenu: (x: number, y: number, row: MsgRow) => void;
+  onReplyClick: (row: MsgRow) => void;
+  onDoubleClick: (row: MsgRow) => void;
 }
 
 /** Padding around a bubble based on its group position. */
@@ -240,19 +241,24 @@ function ReactionsOverlay({ view }: { view: MessageView }) {
 }
 
 export default memo(function MessageRow({
-  view,
+  row,
   onMedia,
   onMenu,
   onReplyClick,
   onDoubleClick,
 }: Props) {
+  const view = row.view;
+  // The parent keeps these stable per row, so `memo` holds: a row only
+  // re-renders when its own message changes, not when the list re-renders.
+  const handleMedia = () => onMedia(row);
+  const handleReplyClick = () => onReplyClick(row);
   return (
     <div
       className={`flex w-full items-start gap-2 px-3 ${rowPadFor(view.firstInGroup, view.lastInGroup)}`}
       onContextMenu={(e) => {
         e.preventDefault();
         e.stopPropagation();
-        onMenu(e.clientX, e.clientY);
+        onMenu(e.clientX, e.clientY, row);
       }}
       onDoubleClick={(e) => {
         // SAFETY: WebKit reports text nodes as event targets, so resolve the
@@ -264,13 +270,13 @@ export default memo(function MessageRow({
         if (!target) return;
         // Links and buttons have their own single-click actions.
         if (target.closest("a, button")) return;
-        onDoubleClick();
+        onDoubleClick(row);
       }}
     >
       <AvatarCell view={view} />
       <div className={`flex min-w-0 flex-1 flex-col ${view.own ? "items-end" : "items-start"}`}>
         <NameTag view={view} />
-        <Bubble view={view} onMedia={onMedia} onReplyClick={onReplyClick} />
+        <Bubble view={view} onMedia={handleMedia} onReplyClick={handleReplyClick} />
         <ReactionsOverlay view={view} />
       </div>
       {!view.own && <div className="w-4 shrink-0" />}
