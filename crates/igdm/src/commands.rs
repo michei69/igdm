@@ -2,8 +2,8 @@
 //! commands return immediately and deliver results through `igdm://event`;
 //! query commands return data directly.
 
-use instagrapi::types::UserShort;
 use base64::Engine;
+use instagrapi::types::UserShort;
 use serde::Deserialize;
 use serde_json::Value;
 use tauri::State;
@@ -36,10 +36,7 @@ pub async fn get_bootstrap(state: State<'_, SharedService>) -> Result<BootstrapD
     let sessions = svc
         .session_files()
         .iter()
-        .filter_map(|p| {
-            p.file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-        })
+        .filter_map(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
         .collect();
     let (reaction_emojis, theme, chat_themes) = svc.settings_bundle();
     Ok(BootstrapData {
@@ -53,11 +50,7 @@ pub async fn get_bootstrap(state: State<'_, SharedService>) -> Result<BootstrapD
 // ---------------------------------------------------------------------- login
 
 #[tauri::command]
-pub fn login_password(
-    state: State<'_, SharedService>,
-    username: String,
-    password: String,
-) {
+pub fn login_password(state: State<'_, SharedService>, username: String, password: String) {
     state.login_password(username, password);
 }
 
@@ -237,12 +230,7 @@ pub fn send_video(state: State<'_, SharedService>, thread_id: String, path: Stri
 }
 
 #[tauri::command]
-pub fn send_voice(
-    state: State<'_, SharedService>,
-    thread_id: String,
-    data: Vec<u8>,
-    ext: String,
-) {
+pub fn send_voice(state: State<'_, SharedService>, thread_id: String, data: Vec<u8>, ext: String) {
     state.send_voice(thread_id, data, ext);
 }
 
@@ -319,7 +307,8 @@ pub fn copy_large_text(app: tauri::AppHandle, text: String) -> Result<(), String
             let _ = tx.send(ok);
         })
         .map_err(|e| e.to_string())?;
-        if rx.recv_timeout(std::time::Duration::from_secs(2))
+        if rx
+            .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap_or(false)
         {
             Ok(())
@@ -330,8 +319,6 @@ pub fn copy_large_text(app: tauri::AppHandle, text: String) -> Result<(), String
     #[cfg(not(target_os = "linux"))]
     {
         use tauri_plugin_clipboard_manager::ClipboardExt;
-        app.clipboard()
-            .write_text(text)
-            .map_err(|e| e.to_string())
+        app.clipboard().write_text(text).map_err(|e| e.to_string())
     }
 }

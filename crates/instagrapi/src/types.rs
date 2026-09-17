@@ -197,7 +197,10 @@ pub struct DirectMessage {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none", deserialize_with = "de_str_or_num")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "de_str_or_num"
+    )]
     pub thread_id: Option<String>,
     pub timestamp: DateTime<Local>,
     #[serde(skip_serializing_if = "Option::is_none")]

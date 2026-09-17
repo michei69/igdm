@@ -327,10 +327,7 @@ pub fn extract_direct_message(data: &Value) -> DirectMessage {
         msg.story_share = obj.get("story_share").cloned().filter(|v| !v.is_null());
         msg.felix_share = obj.get("felix_share").cloned().filter(|v| !v.is_null());
         msg.placeholder = obj.get("placeholder").cloned().filter(|v| !v.is_null());
-        msg.xma_story_share = obj
-            .get("xma_story_share")
-            .cloned()
-            .filter(|v| !v.is_null());
+        msg.xma_story_share = obj.get("xma_story_share").cloned().filter(|v| !v.is_null());
         msg.xma_reel_mention = obj
             .get("xma_reel_mention")
             .cloned()
@@ -474,10 +471,7 @@ pub fn extract_direct_thread(data: &Value) -> DirectThread {
             }
         }
     }
-    thread.theme_data = data
-        .get("theme_data")
-        .filter(|v| !v.is_null())
-        .cloned();
+    thread.theme_data = data.get("theme_data").filter(|v| !v.is_null()).cloned();
     thread
 }
 

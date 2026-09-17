@@ -396,7 +396,10 @@ async fn rupload(
     spec: RuploadSpec<'_>,
 ) -> Result<i64> {
     use reqwest::header::HeaderValue;
-    let url = format!("https://rupload.facebook.com/{}/{entity_name}", spec.messenger);
+    let url = format!(
+        "https://rupload.facebook.com/{}/{entity_name}",
+        spec.messenger
+    );
     let mut headers = messenger_rupload_headers(client).await?;
     for &(name, value) in spec.headers {
         headers.insert(name, HeaderValue::from_static(value));
@@ -412,7 +415,11 @@ async fn rupload(
     let offset: usize = if spec.offset_get {
         let offset_resp = tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            client.upload_http().get(&url).headers(headers.clone()).send(),
+            client
+                .upload_http()
+                .get(&url)
+                .headers(headers.clone())
+                .send(),
         )
         .await
         .map_err(|_| {
@@ -462,7 +469,12 @@ async fn rupload(
     };
     let resp = tokio::time::timeout(
         std::time::Duration::from_secs(spec.post_timeout),
-        client.upload_http().post(&url).headers(headers).body(body).send(),
+        client
+            .upload_http()
+            .post(&url)
+            .headers(headers)
+            .body(body)
+            .send(),
     )
     .await
     .map_err(|_| {
@@ -645,7 +657,10 @@ impl Client {
                 Req::default(),
             )
             .await?;
-        eprintln!("[igdm-media] photo broadcast ok: {}", crate::utils::json_preview(&result, 300));
+        eprintln!(
+            "[igdm-media] photo broadcast ok: {}",
+            crate::utils::json_preview(&result, 300)
+        );
         Self::broadcast_payload(&result, "direct_send_photo")
     }
 
@@ -761,7 +776,11 @@ impl Client {
     /// `media_id` as `attachment_fbid`. The server rejects non-m4a formats at
     /// upload_finish, so input must be AAC in an MP4 container. The waveform
     /// is cosmetic (server does not validate amplitudes).
-    pub async fn direct_send_voice(&self, path: &Path, thread_ids: &[&str]) -> Result<DirectMessage> {
+    pub async fn direct_send_voice(
+        &self,
+        path: &Path,
+        thread_ids: &[&str],
+    ) -> Result<DirectMessage> {
         let audio_bytes = tokio::fs::read(path).await?;
         let upload_id = now_ms().to_string();
         let rand_key: i64 = {
@@ -849,9 +868,7 @@ impl Client {
                     || it.get("pk").and_then(|v| v.as_str()) == Some(story_pk)
             })
             .cloned()
-            .ok_or_else(|| {
-                IgError::client_error(format!("story_info: story {story_pk} not found"))
-            })
+            .ok_or_else(|| IgError::client_error(format!("story_info: story {story_pk} not found")))
     }
 
     /// `media_comments` — one page of comments for a media item

@@ -103,7 +103,8 @@ impl SessionState {
     fn set_uuids(&mut self, uuids: &Map<String, Value>) {
         self.phone_id = get_str_m(uuids, "phone_id").unwrap_or_else(generate_uuid);
         self.uuid = get_str_m(uuids, "uuid").unwrap_or_else(generate_uuid);
-        self.client_session_id = get_str_m(uuids, "client_session_id").unwrap_or_else(generate_uuid);
+        self.client_session_id =
+            get_str_m(uuids, "client_session_id").unwrap_or_else(generate_uuid);
         self.advertising_id = get_str_m(uuids, "advertising_id").unwrap_or_else(generate_uuid);
         self.android_device_id =
             get_str_m(uuids, "android_device_id").unwrap_or_else(generate_android_device_id);
@@ -136,8 +137,14 @@ impl SessionState {
                     "{manufacturer}",
                     get_str_m(d, "manufacturer").unwrap_or_default().as_str(),
                 )
-                .replace("{model}", get_str_m(d, "model").unwrap_or_default().as_str())
-                .replace("{device}", get_str_m(d, "device").unwrap_or_default().as_str())
+                .replace(
+                    "{model}",
+                    get_str_m(d, "model").unwrap_or_default().as_str(),
+                )
+                .replace(
+                    "{device}",
+                    get_str_m(d, "device").unwrap_or_default().as_str(),
+                )
                 .replace("{cpu}", get_str_m(d, "cpu").unwrap_or_default().as_str())
                 .replace("{locale}", self.locale.as_str())
                 .replace(
@@ -537,17 +544,22 @@ impl Client {
         body: &Option<Body>,
         req: Req<'_>,
     ) -> Result<Value> {
-        match self.send_private_request(state, endpoint, body.clone(), req).await {
+        match self
+            .send_private_request(state, endpoint, body.clone(), req)
+            .await
+        {
             Ok(json) => Ok(json),
             Err(e) if e.is(ErrorKind::ClientRequestTimeout) => {
                 log::info!("Wait 60 seconds and try one more time (ClientRequestTimeout)");
                 tokio::time::sleep(Duration::from_secs(60)).await;
-                self.send_private_request(state, endpoint, body.clone(), req).await
+                self.send_private_request(state, endpoint, body.clone(), req)
+                    .await
             }
             Err(e) if e.is(ErrorKind::ClientIncompleteReadError) => {
                 log::info!("Wait 2 seconds and try one more time (ClientIncompleteReadError)");
                 tokio::time::sleep(Duration::from_secs(2)).await;
-                self.send_private_request(state, endpoint, body.clone(), req).await
+                self.send_private_request(state, endpoint, body.clone(), req)
+                    .await
             }
             Err(e) => Err(e),
         }
