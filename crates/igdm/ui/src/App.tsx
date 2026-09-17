@@ -46,7 +46,10 @@ function BootScreen() {
     <div className="flex h-full w-full items-center justify-center bg-bg">
       <div className="flex flex-col items-center gap-3">
         <Logo size={56} />
-        <span className="loading loading-spinner loading-md motion-reduce:animate-none" aria-hidden="true" />
+        <span
+          className="loading loading-spinner loading-md motion-reduce:animate-none"
+          aria-hidden="true"
+        />
       </div>
     </div>
   );
