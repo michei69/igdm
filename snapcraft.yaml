@@ -41,6 +41,12 @@ description: |
 
 grade: stable
 confinement: strict
+# Store icon. The appstream metainfo is deliberately NOT duplicated into
+# snap/gui/: it is already inside the payload (the .deb installs it to
+# /usr/share/metainfo), and snapcraft validates the `snap/gui/<snap-name>
+# .metainfo.xml` copy against the snap name, which is `igdm` while the
+# component id is the reverse-DNS `dev.igdm.client`. Add one only if the snap
+# is actually published to the store.
 icon: snap/gui/igdm.png
 license: MIT
 website: https://github.com/michei69/igdm

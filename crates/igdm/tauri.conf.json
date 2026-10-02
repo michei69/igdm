@@ -34,6 +34,7 @@
     "shortDescription": "Instagram DM desktop client",
     "longDescription": "IG Direct is a desktop client for Instagram Direct messages, built with Tauri 2 and React. Sign in with a username/password (including two-factor) or a session cookie, browse your inbox, and send text, photos, videos and voice messages over a live MQTT connection.",
     "icon": [
+      "icons/icon.png",
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
