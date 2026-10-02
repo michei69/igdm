@@ -169,7 +169,12 @@ export function useMessageListVirtualization({
     }
   }, [rows.length, virtualizer]);
 
-  // Load older when scrolled into top zone.
+  // Load older when scrolled into top zone. Repeat requests for the same
+  // cursor are suppressed by the caller marking the thread `loading_older`
+  // (cleared by the reducer on both `OlderLoaded` and `LoadFailed`), because
+  // this callback is re-created whenever the thread object changes — every
+  // live message, typing or seen event re-ran the effect below and used to
+  // issue one `load_older` per event while the viewport sat near the top.
   const loadOlderIfNeeded = useCallback(() => {
     if (!ts || !ts.has_more || !ts.oldest_cursor || ts.loading_older) return;
     const el = scrollElRef.current;

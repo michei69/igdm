@@ -112,23 +112,35 @@ interface MessageCache {
   whenMs: number;
   attachment: Attachment | null;
   reactionsText: string;
+  /** Author the cached attachment resolved against. Thread metadata arrives
+   * after the messages (ThreadDetails replaces `users`/`nicknames` while
+   * reusing the same message objects), so a share whose author name came from
+   * that resolver has to be rebuilt when it changes. */
+  authorName: string | null;
+  authorUrl: string | null;
 }
 
 const messageCache = new WeakMap<DirectMessage, MessageCache>();
 
 function cacheFor(msg: DirectMessage, resolveAuthor: AuthorResolver): MessageCache {
-  let cached = messageCache.get(msg);
-  if (!cached) {
-    const whenMs = new Date(msg.timestamp).getTime();
-    cached = {
-      dayKey: new Date(whenMs).toDateString(),
-      whenMs,
-      attachment: attachmentFromMsg(msg, resolveAuthor),
-      reactionsText: reactionsText(msg),
-    };
-    messageCache.set(msg, cached);
+  const author = resolveAuthor(msg.user_id);
+  const authorName = author?.name ?? null;
+  const authorUrl = author?.url ?? null;
+  const cached = messageCache.get(msg);
+  if (cached && cached.authorName === authorName && cached.authorUrl === authorUrl) {
+    return cached;
   }
-  return cached;
+  const whenMs = new Date(msg.timestamp).getTime();
+  const next: MessageCache = {
+    dayKey: new Date(whenMs).toDateString(),
+    whenMs,
+    attachment: attachmentFromMsg(msg, resolveAuthor),
+    reactionsText: reactionsText(msg),
+    authorName,
+    authorUrl,
+  };
+  messageCache.set(msg, next);
+  return next;
 }
 
 export function buildRows(ts: ThreadState, meId: string): Row[] {

@@ -391,7 +391,7 @@ struct RuploadSpec<'a> {
 /// resumable offset, POST the remaining bytes, parse the `media_id`.
 async fn rupload(
     client: &Client,
-    bytes: &[u8],
+    bytes: &bytes::Bytes,
     entity_name: &str,
     spec: RuploadSpec<'_>,
 ) -> Result<i64> {
@@ -462,10 +462,12 @@ async fn rupload(
     headers.insert("x-entity-name", HeaderValue::from_str(entity_name).unwrap());
     headers.insert("x-entity-type", HeaderValue::from_static(spec.entity_type));
 
+    // `Bytes::slice` is a refcount bump, not a copy: the payload can be
+    // hundreds of MB (a video) and this used to duplicate all of it.
     let body = if offset < bytes.len() {
-        bytes[offset..].to_vec()
+        bytes.slice(offset..)
     } else {
-        Vec::new()
+        bytes::Bytes::new()
     };
     let resp = tokio::time::timeout(
         std::time::Duration::from_secs(spec.post_timeout),
@@ -500,7 +502,7 @@ async fn rupload(
 async fn photo_rupload(client: &Client, photo_bytes: Vec<u8>, entity_name: &str) -> Result<i64> {
     let media_id = rupload(
         client,
-        &photo_bytes,
+        &bytes::Bytes::from(photo_bytes),
         entity_name,
         RuploadSpec {
             messenger: "messenger_image",
@@ -512,14 +514,14 @@ async fn photo_rupload(client: &Client, photo_bytes: Vec<u8>, entity_name: &str)
         },
     )
     .await?;
-    eprintln!("[igdm-media] messenger_image upload ok (media_id={media_id})");
+    log::debug!("[igdm-media] messenger_image upload ok (media_id={media_id})");
     Ok(media_id)
 }
 
 /// `_video_rupload` — resumable GET offset + POST mp4 bytes.
 async fn video_rupload(
     client: &Client,
-    video_bytes: &[u8],
+    video_bytes: &bytes::Bytes,
     entity_name: &str,
     waterfall_id: &str,
 ) -> Result<i64> {
@@ -547,7 +549,7 @@ async fn video_rupload(
 
 /// `_voice_rupload` — resumable GET offset + POST audio bytes to
 /// messenger_audio, return media_id.
-async fn voice_rupload(client: &Client, audio_bytes: &[u8], entity: &str) -> Result<i64> {
+async fn voice_rupload(client: &Client, audio_bytes: &bytes::Bytes, entity: &str) -> Result<i64> {
     rupload(
         client,
         audio_bytes,
@@ -588,7 +590,7 @@ impl Client {
         thread_ids: &[&str],
         media_id: i64,
     ) -> (String, Map<String, Value>) {
-        let state = self.state().await;
+        let mut state = self.state().await;
         let uuid = state.uuid.clone();
         let android_device_id = state.android_device_id.clone();
         let user_id = state.user_id().unwrap_or(0).to_string();
@@ -649,7 +651,7 @@ impl Client {
         data.insert("btt_dual_send".to_string(), json!("false"));
         data.insert("is_ae_dual_send".to_string(), json!("false"));
         data.insert("offline_threading_id".to_string(), json!(token));
-        eprintln!("[igdm-media] photo broadcast: posting photo_attachment (media_id={media_id})");
+        log::debug!("[igdm-media] photo broadcast: posting photo_attachment (media_id={media_id})");
         let result = self
             .private_request(
                 "direct_v2/threads/broadcast/photo_attachment/",
@@ -657,7 +659,7 @@ impl Client {
                 Req::default(),
             )
             .await?;
-        eprintln!(
+        log::debug!(
             "[igdm-media] photo broadcast ok: {}",
             crate::utils::json_preview(&result, 300)
         );
@@ -670,7 +672,7 @@ impl Client {
         path: &Path,
         thread_ids: &[&str],
     ) -> Result<DirectMessage> {
-        let video_bytes = tokio::fs::read(path).await?;
+        let video_bytes = bytes::Bytes::from(tokio::fs::read(path).await?);
         let metadata = read_video_metadata(&video_bytes)?;
         let size = video_bytes.len();
 
@@ -781,7 +783,7 @@ impl Client {
         path: &Path,
         thread_ids: &[&str],
     ) -> Result<DirectMessage> {
-        let audio_bytes = tokio::fs::read(path).await?;
+        let audio_bytes = bytes::Bytes::from(tokio::fs::read(path).await?);
         let upload_id = now_ms().to_string();
         let rand_key: i64 = {
             use rand::Rng as _;
@@ -890,7 +892,16 @@ impl Client {
     }
 
     /// Download a CDN media URL into `dest_dir`, returning the saved path.
+    ///
+    /// The body streams into a unique `.part` file that is renamed onto the
+    /// final (content-addressed) path only after a complete write: buffering
+    /// the whole media in memory is wasteful for videos, and a partial file
+    /// left by a crash or a full disk would otherwise be returned forever by
+    /// the `exists()` cache check.
     pub async fn download_media(&self, url: &str, dest_dir: &Path) -> Result<std::path::PathBuf> {
+        use futures_util::StreamExt as _;
+        use tokio::io::AsyncWriteExt as _;
+
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(60),
             self.http().get(url).send(),
@@ -910,7 +921,6 @@ impl Client {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let bytes = response.bytes().await.map_err(IgError::from)?;
         let ext = if content_type.contains("video/mp4") {
             ".mp4"
         } else if content_type.contains("audio") {
@@ -922,9 +932,27 @@ impl Client {
         };
         let name = format!("{}{ext}", stable_hash(url));
         let path = dest_dir.join(name);
-        if !path.exists() {
-            tokio::fs::write(&path, &bytes).await?;
+        if path.exists() {
+            return Ok(path);
         }
+        tokio::fs::create_dir_all(dest_dir).await?;
+        let tmp = dest_dir.join(format!("{}.part", crate::utils::generate_uuid()));
+
+        let streamed = async {
+            let mut file = tokio::fs::File::create(&tmp).await?;
+            let mut stream = response.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                file.write_all(&chunk.map_err(IgError::from)?).await?;
+            }
+            file.flush().await?;
+            Ok::<(), IgError>(())
+        }
+        .await;
+        if let Err(e) = streamed {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e);
+        }
+        tokio::fs::rename(&tmp, &path).await?;
         Ok(path)
     }
 }

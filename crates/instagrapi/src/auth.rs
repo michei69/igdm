@@ -18,7 +18,7 @@ use crate::config;
 use crate::error::{ErrorKind, IgError, Result};
 use crate::extract::{extract_account, extract_user_short, extract_user_v1};
 use crate::types::{Account, UserShort};
-use crate::utils::{dumps, generate_jazoest, generate_uuid, now};
+use crate::utils::{dumps, generate_jazoest, generate_uuid, now, write_private};
 
 const WAIT_SECONDS: u64 = 5;
 const CHALLENGE_ATTEMPTS: usize = 24;
@@ -225,7 +225,7 @@ async fn two_factor_login(
     verification_code: &str,
     two_factor_identifier: &str,
 ) -> Result<Value> {
-    let state = client.state().await;
+    let mut state = client.state().await;
     let mut data = Map::new();
     data.insert("verification_code".to_string(), json!(verification_code));
     data.insert("phone_id".to_string(), json!(state.phone_id.clone()));
@@ -311,8 +311,13 @@ impl Client {
             Err(e) => return Err(e),
         }
 
-        let state = self.state().await;
+        // The password envelope is built BEFORE taking the state guard:
+        // `password_encrypt` -> `password_publickeys` -> `public_get` locks
+        // the same non-reentrant state mutex, so holding a guard across it
+        // deadlocks every login (and every later request) forever.
         let enc_password = password_encrypt(self, password).await?;
+
+        let state = self.state().await;
         let mut data = Map::new();
         data.insert(
             "jazoest".to_string(),
@@ -695,13 +700,12 @@ impl Client {
         params: Option<&Map<String, Value>>,
         with_signature: bool,
     ) -> Result<Value> {
-        let mut state = self.state().await;
         let req = Req {
             params,
             with_signature,
             ..Req::default()
         };
-        self.send_with_retry(&mut state, endpoint, &body, req).await
+        self.send_with_retry(endpoint, &body, req).await
     }
 
     // ------------------------------------------------------- session files
@@ -715,10 +719,17 @@ impl Client {
     }
 
     /// Serialize the current session settings to a JSON file.
+    ///
+    /// The file carries the `sessionid` cookie and the `authorization_data`
+    /// bearer, i.e. full account access, so it is written 0600 (on unix) and
+    /// through a temp file + rename: a crash mid-write must not leave
+    /// truncated JSON behind, or the saved session is silently destroyed.
     pub async fn dump_settings(&self, path: &Path) -> Result<()> {
         let settings = self.get_settings().await;
         let text = serde_json::to_string_pretty(&settings)?;
-        tokio::fs::write(path, text).await?;
+        let tmp = path.with_extension("json.tmp");
+        write_private(&tmp, text.as_bytes()).await?;
+        tokio::fs::rename(&tmp, path).await?;
         Ok(())
     }
 

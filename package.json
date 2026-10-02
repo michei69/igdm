@@ -6,13 +6,17 @@
   "scripts": {
     "dev": "cd crates/igdm && tauri dev",
     "build": "cd crates/igdm && tauri build",
+    "build:linux": "cd crates/igdm && NO_STRIP=1 tauri build --bundles deb,rpm,appimage",
+    "build:flatpak": "bash scripts/build-flatpak.sh",
     "run": "cargo run -p igdm",
-    "typecheck": "bun --cwd crates/igdm/ui run typecheck",
-    "doctor": "bun --cwd crates/igdm/ui run doctor",
-    "frontend:install": "bun --cwd crates/igdm/ui install",
-    "frontend:build": "bun --cwd crates/igdm/ui run build"
+    "typecheck": "bun run --cwd crates/igdm/ui typecheck",
+    "lint": "bun run --cwd crates/igdm/ui lint",
+    "format:check": "bun run --cwd crates/igdm/ui format:check",
+    "doctor": "bun run --cwd crates/igdm/ui doctor",
+    "frontend:install": "bun install --cwd crates/igdm/ui",
+    "frontend:build": "bun run --cwd crates/igdm/ui build"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2.11.4"
+    "@tauri-apps/cli": "^2.12.1"
   }
 }

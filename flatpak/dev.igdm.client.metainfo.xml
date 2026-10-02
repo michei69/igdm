@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>dev.igdm.client</id>
+
+  <launchable type="desktop-id">dev.igdm.client.desktop</launchable>
+
+  <name>IG Direct</name>
+  <summary>Instagram DM desktop client</summary>
+  <developer id="dev.igdm">
+    <name>igdm</name>
+  </developer>
+
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+
+  <content_rating type="oars-1.1">
+    <content_attribute id="social-chat">intense</content_attribute>
+    <content_attribute id="social-info">moderate</content_attribute>
+    <content_attribute id="social-audio">moderate</content_attribute>
+    <content_attribute id="social-contacts">none</content_attribute>
+  </content_rating>
+
+  <description>
+    <p>
+      IG Direct is a desktop client for Instagram Direct messages, built with Tauri 2
+      and React.
+    </p>
+    <p>
+      It talks to Instagram's private mobile API directly, so it needs neither the web
+      app nor a browser: sign in with a username and password (two-factor and
+      SMS/email challenges included) or a session cookie, then browse your inbox with
+      search, live typing indicators, read receipts, reactions and media previews.
+    </p>
+    <p>
+      Messages are delivered over a persistent MQTToT connection with automatic
+      reconnects, and you can send text, photos, videos and voice messages.
+    </p>
+  </description>
+
+  <url type="homepage">https://github.com/michei69/igdm</url>
+  <url type="vcs-browser">https://github.com/michei69/igdm</url>
+  <url type="bugtracker">https://github.com/michei69/igdm/issues</url>
+
+  <categories>
+    <category>Network</category>
+    <category>InstantMessaging</category>
+  </categories>
+
+  <keywords>
+    <keyword>instagram</keyword>
+    <keyword>direct</keyword>
+    <keyword>messages</keyword>
+    <keyword>chat</keyword>
+    <keyword>dm</keyword>
+  </keywords>
+
+  <branding>
+    <color type="primary" scheme_preference="light">#d53088</color>
+    <color type="primary" scheme_preference="dark">#7b3ff2</color>
+  </branding>
+
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+    <control>touch</control>
+  </supports>
+
+  <recommends>
+    <display_length compare="ge">700</display_length>
+  </recommends>
+
+  <releases>
+    <release version="0.1.0" date="2026-09-04">
+      <description>
+        <p>First release.</p>
+      </description>
+    </release>
+  </releases>
+</component>

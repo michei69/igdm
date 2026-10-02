@@ -67,10 +67,20 @@ export default function MessageList({ onPreview, onShare }: Props) {
   const ts: ThreadState | undefined = openKey ? state.threads[openKey] : undefined;
   const meId = state.me.user_id;
 
+  // `loading_older` is what keeps a second request for the same cursor from
+  // being issued (the reducer clears it on `OlderLoaded` and on failure).
+  const requestOlder = useCallback(
+    (threadId: string, cursor: string) => {
+      updateThread(threadId, (t) => ({ ...t, loading_older: true }));
+      loadOlder(threadId, cursor);
+    },
+    [updateThread, loadOlder],
+  );
+
   const menuHostRef = useRef<{ open: (x: number, y: number, msg: DirectMessage) => void }>(null);
 
   const { scrollElRef, rows, virtualizer, totalSize, showJump, jumpToBottom, loadOlderIfNeeded } =
-    useMessageListVirtualization({ ts, meId, openKey, loadOlder });
+    useMessageListVirtualization({ ts, meId, openKey, loadOlder: requestOlder });
 
   // Scroll to the reply target once its row exists.
   useEffect(() => {

@@ -48,14 +48,17 @@ interface RemoteImageHook {
  */
 export function useRemoteImage(url: string | null | undefined): RemoteImageHook {
   const [state, setState] = useState<ImageState>({ url: url ?? null, dataUrl: null });
+  // Latched per URL rather than as a boolean: virtualized rows and the lightbox
+  // reuse one hook instance across URLs, so a latch left set by the previous URL
+  // would suppress the backend fallback for every later one.
+  const failedRef = useRef<string | null>(null);
   if (state.url !== (url ?? null)) {
     setState({ url: url ?? null, dataUrl: null });
   }
-  const failedRef = useRef(false);
 
   const onError = useCallback(() => {
-    if (failedRef.current || !url) return;
-    failedRef.current = true;
+    if (failedRef.current === url || !url) return;
+    failedRef.current = url;
     const cached = cacheGet(url);
     if (cached) {
       setState({ url, dataUrl: cached });

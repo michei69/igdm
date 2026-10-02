@@ -1,11 +1,39 @@
 //! Small helpers ported from `instagrapi.utils`: JSON navigation, the
 //! Instagram JSON dumps format, form/query encoding, token/uuid generation.
 
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rand::{Rng, RngCore};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+
+/// Write `data` to `path`, owner-only (0600) on unix.
+///
+/// Used for files that carry account credentials (dumped sessions hold the
+/// `sessionid` cookie and the authorization bearer). The file is created with
+/// the restricted mode rather than chmod-ed afterwards, so it is never briefly
+/// world-readable.
+pub async fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .await?;
+        file.write_all(data).await?;
+        file.flush().await?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::fs::write(path, data).await
+    }
+}
 
 /// Navigate one string key.
 pub fn get<'a>(data: &'a Value, key: &str) -> Option<&'a Value> {

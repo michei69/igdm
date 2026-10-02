@@ -32,6 +32,10 @@ export interface MessageView {
 }
 
 interface Props {
+  /** The row model. Passed whole (instead of only `view`) so this component's
+   * props stay referentially stable and `memo` can bail out: the parent used
+   * to hand down a fresh arrow function per callback on every render, which
+   * made every visible row re-render on each scroll tick. */
   row: MsgRow;
   onMedia: (row: MsgRow) => void;
   onMenu: (x: number, y: number, row: MsgRow) => void;

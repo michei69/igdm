@@ -12,23 +12,25 @@ fn build_frontend_if_missing() {
         return;
     }
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
-    let index = std::path::Path::new(&manifest).join("ui/dist/index.html");
-    if index.exists() {
+    let ui = std::path::Path::new(&manifest).join("ui");
+    if ui.join("dist/index.html").exists() {
         return;
     }
-    // The project is bun-only (bun.lock, bun scripts); use the same tool the
-    // root package.json scripts call (`bun --cwd <dir> run <script>`).
-    eprintln!("[igdm] frontend build missing — running `bun --cwd ui run build`");
+    // The project is bun-only (bun.lock, bun scripts). Run bun *inside* ui/
+    // rather than passing `--cwd`: bun 1.4 rejects `bun --cwd <dir> run
+    // <script>` (it prints the `bun run` usage instead of running anything),
+    // only the `--cwd=<dir>` form is accepted.
+    eprintln!("[igdm] frontend build missing — running `bun run build` in crates/igdm/ui");
     let ok = std::process::Command::new("bun")
-        .args(["--cwd", "ui", "run", "build"])
-        .current_dir(&manifest)
+        .args(["run", "build"])
+        .current_dir(&ui)
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
     if !ok {
         eprintln!(
             "[igdm] WARNING: frontend build failed; cargo run / tauri build will fail \
-             on missing web assets (run `bun --cwd crates/igdm/ui install` first)"
+             on missing web assets (run `bun install --cwd crates/igdm/ui` first)"
         );
     }
 }

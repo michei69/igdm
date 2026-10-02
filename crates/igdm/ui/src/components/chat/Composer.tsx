@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState, type ClipboardEvent } from "react";
-import { open } from "@tauri-apps/plugin-dialog";
+import { invoke } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 import { useApp } from "../../hooks/useApp";
+import { useVoiceRecorder } from "../../hooks/useVoiceRecorder";
 import type { ReplyInfo } from "../../state";
 
-const IMAGE_EXTS = ["jpg", "jpeg", "png", "webp"];
-const VIDEO_EXTS = ["mp4", "mov", "mkv", "webm"];
+const IMAGE_EXTS = new Set(["jpg", "jpeg", "png", "webp"]);
+const VIDEO_EXTS = new Set(["mp4", "mov", "mkv", "webm"]);
 
 export default function Composer() {
   const {
@@ -20,110 +21,27 @@ export default function Composer() {
     setReplyScroll,
   } = useApp();
   const [value, setValue] = useState("");
-  const [recording, setRecording] = useState(false);
-  const [elapsed, setElapsed] = useState(0);
   const inputRef = useRef<HTMLInputElement | null>(null);
   const prevReplyRef = useRef<ReplyInfo | null>(null);
-  const recorderRef = useRef<MediaRecorder | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
-  const timerRef = useRef<number | null>(null);
-  const disposedRef = useRef(false);
+  /** True while the backend has been told this thread is typing. */
+  const typingSentRef = useRef(false);
 
   const openKey = state.openKey ?? "";
   const virtualKey = openKey.startsWith("user:");
   const canSend = value.trim().length > 0;
 
-  // Stop recording and drop the stream; returns the recorder so the caller
-  // decides whether to send what was captured.
-  const stopRecording = () => {
-    if (timerRef.current) {
-      clearInterval(timerRef.current);
-      timerRef.current = null;
-    }
-    setElapsed(0);
-    setRecording(false);
-    const rec = recorderRef.current;
-    recorderRef.current = null;
-    streamRef.current?.getTracks().forEach((t) => t.stop());
-    streamRef.current = null;
-    return rec;
-  };
+  const { recording, elapsed, toggle: toggleRecord } = useVoiceRecorder(openKey, sendVoice);
 
-  // Finish a recording: stop it and send the captured bytes. The webview
-  // records webm/opus (or mp4 when the webview supports it); the backend
-  // transcodes to m4a before upload.
-  const sendRecorded = (rec: MediaRecorder) => {
-    rec.onstop = () => {
-      const blob = new Blob(chunksRef.current, { type: rec.mimeType });
-      chunksRef.current = [];
-      if (blob.size === 0) return;
-      const ext = rec.mimeType.includes("mp4") ? "mp4" : "webm";
-      void blob.arrayBuffer().then((buf) => sendVoice(openKey, new Uint8Array(buf), ext));
-    };
-    if (rec.state !== "inactive") rec.stop();
-  };
-
-  const toggleRecord = async () => {
-    if (openKey.length === 0) return;
+  // Media can only be sent to a thread that exists on the server; a virtual
+  // `user:<pk>` thread has to be created by sending text first.
+  const requireRealThread = () => {
+    if (openKey.length === 0) return false;
     if (virtualKey) {
       toast("Open an existing chat to send media");
-      return;
+      return false;
     }
-    if (recording) {
-      const rec = stopRecording();
-      if (rec) sendRecorded(rec);
-      return;
-    }
-    if (typeof MediaRecorder === "undefined") {
-      toast("Voice recording is not supported in this webview");
-      return;
-    }
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      // Guard against unmount race: if component unmounted while awaiting, stop tracks immediately.
-      if (disposedRef.current) {
-        stream.getTracks().forEach((t) => t.stop());
-        return;
-      }
-      streamRef.current = stream;
-      const mimeType = MediaRecorder.isTypeSupported("audio/mp4;codecs=mp4a.40.2")
-        ? "audio/mp4;codecs=mp4a.40.2"
-        : "audio/webm;codecs=opus";
-      const rec = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
-      recorderRef.current = rec;
-      chunksRef.current = [];
-      rec.ondataavailable = (e) => {
-        if (e.data.size > 0) chunksRef.current.push(e.data);
-      };
-      rec.start();
-      setRecording(true);
-      setElapsed(0);
-      timerRef.current = setInterval(() => setElapsed((s) => s + 1), 1000);
-    } catch (err) {
-      streamRef.current?.getTracks().forEach((t) => t.stop());
-      streamRef.current = null;
-      toast(`Mic unavailable: ${err instanceof Error ? err.message : String(err)}`);
-    }
+    return true;
   };
-
-  // Switching threads cancels an in-progress recording without sending.
-  useEffect(() => {
-    if (!recording) return;
-    stopRecording()?.stop();
-  }, [openKey, recording]);
-
-  // Cleanup on unmount.
-  useEffect(() => {
-    return () => {
-      disposedRef.current = true;
-      const rec = stopRecording();
-      if (rec && rec.state !== "inactive") {
-        rec.onstop = null;
-        rec.stop();
-      }
-    };
-  }, []);
 
   // Starting a reply (via the message context menu) focuses the input so
   // typing can begin immediately. Fires on reply *changes* only, not on
@@ -137,17 +55,40 @@ export default function Composer() {
     inputRef.current?.focus();
   }, [state.reply, openKey]);
 
-  // Typing indicator: active while typing, stops 2.5s after the last key.
+  // Typing indicator: published once when typing starts, cleared 2.5s after
+  // the last keystroke. Publishing on every `value` change issued one IPC call
+  // (and one IG request) per character.
   useEffect(() => {
     if (openKey.length === 0 || virtualKey) return;
     if (value.trim().length === 0) {
-      sendTyping(openKey, false);
+      if (typingSentRef.current) {
+        typingSentRef.current = false;
+        sendTyping(openKey, false);
+      }
       return;
     }
-    sendTyping(openKey, true);
-    const t = setTimeout(() => sendTyping(openKey, false), 2500);
+    if (!typingSentRef.current) {
+      typingSentRef.current = true;
+      sendTyping(openKey, true);
+    }
+    const t = setTimeout(() => {
+      typingSentRef.current = false;
+      sendTyping(openKey, false);
+    }, 2500);
     return () => clearTimeout(t);
   }, [value, openKey, virtualKey, sendTyping]);
+
+  // Leaving a thread (or unmounting) with a pending indicator clears it, so
+  // the other participant does not stay flagged as "typing" until the
+  // server-side expiry.
+  useEffect(() => {
+    return () => {
+      if (typingSentRef.current) {
+        typingSentRef.current = false;
+        sendTyping(openKey, false);
+      }
+    };
+  }, [openKey, sendTyping]);
 
   const doSend = () => {
     const text = value.trim();
@@ -165,6 +106,17 @@ export default function Composer() {
     setValue("");
   };
 
+  const sendPastedImages = async (files: File[]) => {
+    if (!requireRealThread()) return;
+    toast("Uploading photo…");
+    await Promise.all(
+      files.map(async (file) => {
+        const ext = file.type === "image/jpeg" ? "jpg" : (file.type.split("/")[1] ?? "png");
+        sendPhotoBytes(openKey, new Uint8Array(await file.arrayBuffer()), ext);
+      }),
+    );
+  };
+
   // Paste an image from the clipboard into the input -> auto-send it.
   const onPaste = (e: ClipboardEvent<HTMLInputElement>) => {
     const files = Array.from(e.clipboardData.items).flatMap((item) => {
@@ -179,42 +131,34 @@ export default function Composer() {
     void sendPastedImages(files);
   };
 
-  const sendPastedImages = async (files: File[]) => {
-    if (openKey.length === 0) return;
-    if (virtualKey) {
-      toast("Open an existing chat to send media");
-      return;
-    }
-    toast("Uploading photo…");
-    await Promise.all(
-      files.map(async (file) => {
-        const ext = file.type === "image/jpeg" ? "jpg" : (file.type.split("/")[1] ?? "png");
-        sendPhotoBytes(openKey, new Uint8Array(await file.arrayBuffer()), ext);
-      }),
-    );
-  };
-
   const doAttach = async () => {
-    if (openKey.length === 0) return;
-    const file = await open({
-      multiple: false,
-      filters: [{ name: "Images and videos", extensions: [...IMAGE_EXTS, ...VIDEO_EXTS] }],
-    });
-    if (!file) return;
-    if (virtualKey) {
-      toast("Open an existing chat to send media");
+    if (!requireRealThread()) return;
+    // The picker runs in the backend: only paths it returns are accepted by
+    // send_photo/send_video, so a compromised renderer cannot ask for an
+    // arbitrary file to be uploaded.
+    let file: string | null = null;
+    try {
+      file = await invoke<string | null>("pick_media");
+    } catch (err) {
+      toast(`Could not open the file picker: ${err instanceof Error ? err.message : String(err)}`);
       return;
     }
+    if (!file) return;
     const ext = file.split(".").pop()?.toLowerCase() ?? "";
-    if (IMAGE_EXTS.includes(ext)) {
+    if (IMAGE_EXTS.has(ext)) {
       toast("Uploading photo…");
       sendPhoto(openKey, file);
-    } else if (VIDEO_EXTS.includes(ext)) {
+    } else if (VIDEO_EXTS.has(ext)) {
       toast("Uploading video…");
       sendVideo(openKey, file);
     } else {
       toast("Only images and videos are supported");
     }
+  };
+
+  const onRecordClick = () => {
+    if (!requireRealThread()) return;
+    void toggleRecord();
   };
 
   return (
@@ -245,7 +189,7 @@ export default function Composer() {
           color: recording ? "#ffffff" : "var(--ct-circle-icon, var(--ct-icon))",
           borderColor: recording ? "#ef4444" : "var(--ct-separator)",
         }}
-        onClick={() => void toggleRecord()}
+        onClick={onRecordClick}
         aria-label={recording ? "Stop recording and send" : "Record voice message"}
         title={recording ? "Stop and send" : "Record voice message"}
       >

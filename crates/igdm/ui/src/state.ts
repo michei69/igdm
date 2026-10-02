@@ -267,6 +267,8 @@ export type AppEvent =
     }
   | { type: "Sent"; key: string; realThreadId: string; msg: DirectMessage }
   | { type: "SendFailed"; key: string; text: string }
+  /** A history fetch (page of messages / thread details) failed. */
+  | { type: "LoadFailed"; key: string; text: string }
   | { type: "SearchResults"; query: string; users: UserShort[] }
   | { type: "SearchFailed"; query: string }
   | { type: "ThreadByUser"; user: UserShort; threadId: string | null }

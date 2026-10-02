@@ -109,6 +109,11 @@ export function decodeEvent(wire: WireEvent): AppEvent {
       const [key, text] = wire.data as [string, string];
       return { type: "SendFailed", key, text };
     }
+    case "LoadFailed": {
+      // SAFETY: LoadFailed serializes as [key, text].
+      const [key, text] = wire.data as [string, string];
+      return { type: "LoadFailed", key, text };
+    }
     case "SearchResults": {
       // SAFETY: SearchResults serializes as [query, users].
       const [query, users] = wire.data as [string, UserShort[]];

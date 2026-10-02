@@ -2,9 +2,9 @@
 //! MQTToT realtime reader task and every network operation. Emits `AppEvent`s
 //! to the React frontend over the Tauri event channel; never touches UI.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -95,6 +95,26 @@ fn log_unhandled_messages(source: &str, messages: &[DirectMessage]) {
     }
 }
 
+/// Reject anything that is not a plain numeric id.
+///
+/// Ids arrive from the webview and several of them are interpolated straight
+/// into the request path (`direct_v2/threads/{id}/`, `direct_v2/threads/{id}/
+/// items/{id}/seen/`, `media/{id}/info/`, `feed/user/{id}/story/`); a value
+/// like `123/../../v1/accounts/current_user` would normalize into a *different*
+/// authenticated endpoint, turning those commands into a general request
+/// primitive.
+fn checked_id<'a>(what: &str, id: &'a str) -> Result<&'a str> {
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(IgError::client_error(format!("invalid {what}: {id:?}")));
+    }
+    Ok(id)
+}
+
+/// `checked_id` for thread ids (the common case).
+fn checked_thread_id(thread_id: &str) -> Result<&str> {
+    checked_id("thread id", thread_id)
+}
+
 /// Write media bytes (pasted image, recorded voice) to a uniquely named
 /// temp file.
 fn write_temp_media(what: &str, data: &[u8], ext: &str) -> std::result::Result<PathBuf, String> {
@@ -133,6 +153,7 @@ async fn transcode_to_m4a(input: &Path) -> std::result::Result<PathBuf, String> 
         .arg("-version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
         .status()
         .await
         .map(|s| s.success())
@@ -147,16 +168,25 @@ async fn transcode_to_m4a(input: &Path) -> std::result::Result<PathBuf, String> 
         );
     }
     let output = input.with_extension("m4a");
-    let status = tokio::process::Command::new("ffmpeg")
-        .args(["-y", "-i"])
-        .arg(input)
-        .args(["-c:a", "aac", "-b:a", "96k", "-f", "mp4"])
-        .arg(&output)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
-        .map_err(|e| format!("Could not run ffmpeg: {e}"))?;
+    // A malformed recording can make ffmpeg block on a stream it never
+    // closes; without the timeout the send task would hang forever with no
+    // `SendFailed`, and without `kill_on_drop` the child would be orphaned if
+    // the app exits first.
+    let status = tokio::time::timeout(
+        Duration::from_secs(120),
+        tokio::process::Command::new("ffmpeg")
+            .args(["-y", "-i"])
+            .arg(input)
+            .args(["-c:a", "aac", "-b:a", "96k", "-f", "mp4"])
+            .arg(&output)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .status(),
+    )
+    .await
+    .map_err(|_| "ffmpeg timed out converting the voice recording".to_string())?
+    .map_err(|e| format!("Could not run ffmpeg: {e}"))?;
     if !status.success() || !output.exists() {
         let _ = std::fs::remove_file(&output);
         return Err("ffmpeg failed to convert the voice recording to m4a".to_string());
@@ -172,6 +202,17 @@ pub struct Service {
     pending_code: Arc<Mutex<Option<oneshot::Sender<String>>>>,
     realtime: Arc<Mutex<Option<Arc<RealtimeClient>>>>,
     running: Arc<AtomicBool>,
+    /// Bumped on every login/logout. Spawned work captures it and drops its
+    /// result instead of emitting when the session it started for is gone, so
+    /// a previous account's inbox/messages cannot repopulate the next session.
+    epoch: Arc<AtomicU64>,
+    /// Handle of the running realtime loop, so a re-login aborts the old one
+    /// instead of leaving two MQTT sessions subscribed to the same topics.
+    realtime_task: Arc<Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>,
+    /// Absolute paths the user selected through the native file dialog, i.e.
+    /// the only files `send_photo`/`send_video` will read. Without this the
+    /// renderer could ask the backend to upload any file the process can read.
+    picked_files: Arc<Mutex<HashSet<PathBuf>>>,
     me_id: Arc<RwLock<String>>,
     thread_raw: Arc<Mutex<HashMap<String, Arc<Value>>>>,
 }
@@ -186,6 +227,9 @@ impl Service {
             pending_code: pending.clone(),
             realtime: Arc::new(Mutex::new(None)),
             running: Arc::new(AtomicBool::new(false)),
+            epoch: Arc::new(AtomicU64::new(0)),
+            realtime_task: Arc::new(Mutex::new(None)),
+            picked_files: Arc::new(Mutex::new(HashSet::new())),
             me_id: Arc::new(RwLock::new(String::new())),
             thread_raw: Arc::new(Mutex::new(HashMap::new())),
         });
@@ -248,6 +292,11 @@ impl Service {
         self.emit(AppEvent::ThreadDetails(thread_id, thread, meta));
     }
 
+    /// Report a history-load failure (page of messages, older page, details).
+    pub fn emit_load_failed(&self, key: String, text: String) {
+        self.emit(AppEvent::LoadFailed(key, text));
+    }
+
     fn spawn(&self, fut: impl std::future::Future<Output = ()> + Send + 'static) {
         tauri::async_runtime::spawn(fut);
     }
@@ -287,13 +336,23 @@ impl Service {
     }
 
     /// Persist one settings key, preserving all other keys.
+    ///
+    /// Written to a sibling temp file and renamed into place: `fs::write`
+    /// truncates before writing, so a crash mid-write leaves truncated JSON,
+    /// which `read_settings` then silently discards — resetting the user's
+    /// theme and reaction emojis with no error anywhere.
     fn write_settings_key(&self, key: &str, value: Value) {
+        let path = self.settings_path();
         let mut map = self.read_settings();
         map.insert(key.to_string(), value);
-        let _ = std::fs::write(
-            self.settings_path(),
-            serde_json::to_string_pretty(&serde_json::Value::Object(map)).unwrap_or_default(),
-        );
+        let Ok(text) = serde_json::to_string_pretty(&serde_json::Value::Object(map)) else {
+            log::error!("could not serialize settings; {} not saved", key);
+            return;
+        };
+        let tmp = path.with_extension("json.tmp");
+        if let Err(e) = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, &path)) {
+            log::error!("could not save settings ({key}): {e}");
+        }
     }
 
     /// Reaction emojis persisted in `~/.igdm/settings.json`.
@@ -418,7 +477,38 @@ impl Service {
         });
     }
 
+    /// Record a path the user picked in the native dialog, so the send
+    /// commands will read it.
+    pub async fn remember_picked_file(&self, path: PathBuf) {
+        self.picked_files.lock().await.insert(path);
+    }
+
+    /// Guard for renderer-supplied upload paths: only files the user picked
+    /// through the native dialog are accepted.
+    async fn checked_upload_path(&self, path: PathBuf) -> std::result::Result<PathBuf, String> {
+        let picked = self.picked_files.lock().await;
+        if !picked.contains(&path) {
+            return Err("Refusing to upload a file that was not chosen in the file picker".into());
+        }
+        drop(picked);
+        if !path.is_file() {
+            return Err(format!("Not a file: {}", path.display()));
+        }
+        Ok(path)
+    }
+
+    /// Invalidate every task spawned for a previous session.
+    fn bump_epoch(&self) -> u64 {
+        self.epoch.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// True while `epoch` is still the current session's.
+    fn is_current(&self, epoch: u64) -> bool {
+        self.epoch.load(Ordering::SeqCst) == epoch
+    }
+
     async fn adopt(&self, persist: bool) {
+        self.bump_epoch();
         let client = &self.client;
         let mut username = client.username().await;
         let user_id = client
@@ -442,11 +532,16 @@ impl Service {
             user_id,
             profile_pic_url,
         }));
-        self.start_realtime();
+        self.start_realtime(self.epoch.load(Ordering::SeqCst));
     }
 
     pub fn logout(&self) {
         let svc = self.clone();
+        // Bumping the epoch drops the results of every in-flight task (an
+        // inbox refresh or message load can take many round trips and would
+        // otherwise repopulate the UI after `LoggedOut`), and the caches are
+        // cleared so the next account cannot read the previous one's payloads.
+        let epoch = self.bump_epoch();
         svc.stop_realtime();
         self.spawn(async move {
             let client = &svc.client;
@@ -456,24 +551,43 @@ impl Service {
                 let path = svc.session_path(&username);
                 let _ = std::fs::remove_file(path);
             }
-            svc.emit(AppEvent::LoggedOut);
+            *svc.me_id.write().unwrap_or_else(|e| e.into_inner()) = String::new();
+            svc.thread_raw.lock().await.clear();
+            if svc.is_current(epoch) {
+                svc.emit(AppEvent::LoggedOut);
+            }
         });
     }
 
     // -------------------------------------------------------------- realtime
 
-    fn start_realtime(&self) {
+    fn start_realtime(&self, epoch: u64) {
         self.running.store(true, Ordering::SeqCst);
         let svc = self.clone();
+        let handle = tauri::async_runtime::spawn(async move {
+            svc.realtime_loop(epoch).await;
+        });
+        // A re-login while already connected used to leave the previous MQTT
+        // session alive: both loops stayed subscribed to the same topics and
+        // emitted every inbound message twice, and the orphaned socket could
+        // never be closed.
+        let slot = self.realtime_task.clone();
         self.spawn(async move {
-            svc.realtime_loop().await;
+            let previous = slot.lock().await.replace(handle);
+            if let Some(previous) = previous {
+                previous.abort();
+            }
         });
     }
 
     fn stop_realtime(&self) {
         self.running.store(false, Ordering::SeqCst);
         let realtime = self.realtime.clone();
+        let slot = self.realtime_task.clone();
         self.spawn(async move {
+            if let Some(handle) = slot.lock().await.take() {
+                handle.abort();
+            }
             let rt = realtime.lock().await.take();
             if let Some(rt) = rt {
                 let _ = rt.shutdown_transport().await;
@@ -513,18 +627,30 @@ impl Service {
         }
     }
 
-    async fn realtime_loop(&self) {
+    async fn realtime_loop(&self, epoch: u64) {
         let mut attempts = 0usize;
-        while self.running.load(Ordering::SeqCst) && attempts < 6 {
+        // Retry until this session ends: a laptop suspend or a brief Wi-Fi
+        // drop used to exhaust a fixed retry budget and leave the app offline
+        // for the rest of the session with no way to reconnect.
+        while self.running.load(Ordering::SeqCst) && self.is_current(epoch) {
             let result = self.realtime_connect_once().await;
             match result {
                 Ok(rt) => {
-                    attempts = 0;
-                    self.emit(AppEvent::Status(true, "live".to_string()));
+                    // Deliveries reset the backoff only once the connection has
+                    // actually carried a packet or stayed up a while. Resetting
+                    // on connect alone means an accepted-then-dropped socket
+                    // (expired sessionid, duplicate-session kick) spins
+                    // connect/subscribe/drop with no delay at all.
+                    let connected_at = Instant::now();
                     let mut last_rx = Instant::now();
-                    while self.running.load(Ordering::SeqCst) {
+                    let mut delivered = false;
+                    self.emit(AppEvent::Status(true, "live".to_string()));
+                    while self.running.load(Ordering::SeqCst) && self.is_current(epoch) {
                         match rt.read_once().await {
-                            Ok(_) => last_rx = Instant::now(),
+                            Ok(_) => {
+                                delivered = true;
+                                last_rx = Instant::now();
+                            }
                             Err(e) if e.is(ErrorKind::ClientRequestTimeout) => {
                                 // idle: keep the connection alive with a PINGREQ
                                 if last_rx.elapsed() > Duration::from_secs(20) {
@@ -536,8 +662,27 @@ impl Service {
                         }
                     }
                     self.realtime_disconnect().await;
-                    if !self.running.load(Ordering::SeqCst) {
+                    if !self.running.load(Ordering::SeqCst) || !self.is_current(epoch) {
                         break;
+                    }
+                    if delivered || connected_at.elapsed() > Duration::from_secs(30) {
+                        attempts = 0;
+                    } else {
+                        attempts += 1;
+                    }
+                    let wait = (1u64 << attempts.min(5)).min(30);
+                    if attempts > 0 {
+                        self.emit(AppEvent::Status(
+                            false,
+                            format!("connection lost — retry in {wait}s"),
+                        ));
+                    }
+                    let deadline = Instant::now() + Duration::from_secs(wait);
+                    while self.running.load(Ordering::SeqCst)
+                        && self.is_current(epoch)
+                        && Instant::now() < deadline
+                    {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
                     }
                 }
                 Err(e) => {
@@ -549,17 +694,14 @@ impl Service {
                     ));
                     self.realtime_disconnect().await;
                     let deadline = Instant::now() + Duration::from_secs(wait);
-                    while self.running.load(Ordering::SeqCst) && Instant::now() < deadline {
+                    while self.running.load(Ordering::SeqCst)
+                        && self.is_current(epoch)
+                        && Instant::now() < deadline
+                    {
                         tokio::time::sleep(Duration::from_millis(200)).await;
                     }
                 }
             }
-        }
-        if self.running.load(Ordering::SeqCst) {
-            self.emit(AppEvent::Status(
-                false,
-                "disconnected (retries exhausted)".to_string(),
-            ));
         }
     }
 
@@ -934,6 +1076,7 @@ impl Service {
     /// Fetch one thread from the API, cache its raw JSON, and return the
     /// `{ thread, raw_response }` envelope the "copy raw data" menu copies.
     async fn fetch_thread_raw(&self, thread_id: &str) -> Result<Value> {
+        let thread_id = checked_thread_id(thread_id)?;
         let mut params = Map::new();
         params.insert(
             "visual_message_return_type".to_string(),
@@ -973,12 +1116,14 @@ impl Service {
     /// from here. `None` on any failure — the modal falls back to the
     /// preview image.
     pub async fn reel_info(&self, media_id: &str) -> Option<Value> {
+        checked_id("media id", media_id).ok()?;
         self.client.media_info(media_id).await.ok()
     }
 
     /// One page of comments for a media item (`media/{pk}/comments/`);
     /// `max_id` paginates.
     pub async fn media_comments(&self, media_id: &str, max_id: Option<String>) -> Option<Value> {
+        checked_id("media id", media_id).ok()?;
         self.client
             .media_comments(media_id, max_id.as_deref())
             .await
@@ -988,6 +1133,8 @@ impl Service {
     /// One story item (playable video included) by pk, resolved from the
     /// author's active reel — does NOT mark the story as seen.
     pub async fn story_info(&self, story_id: &str, owner_id: &str) -> Option<Value> {
+        checked_id("story id", story_id).ok()?;
+        checked_id("owner id", owner_id).ok()?;
         self.client.story_info(story_id, owner_id).await.ok()
     }
 
@@ -1025,7 +1172,7 @@ impl Service {
             );
         }
         // Virtual `user:<pk>` keys are not thread ids — nothing to fetch.
-        if !thread_id.bytes().all(|b| b.is_ascii_digit()) {
+        if checked_thread_id(thread_id).is_err() {
             return None;
         }
         let value = self.fetch_thread_raw(thread_id).await.ok()?;
@@ -1039,6 +1186,7 @@ impl Service {
         amount: i64,
         cursor: Option<&str>,
     ) -> Result<(Vec<DirectMessage>, Option<String>, bool)> {
+        let thread_id = checked_thread_id(thread_id)?;
         let mut params = Map::new();
         params.insert(
             "visual_message_return_type".to_string(),
@@ -1107,7 +1255,7 @@ impl Service {
                     ));
                 }
                 Err(e) => {
-                    svc.emit(AppEvent::SendFailed(
+                    svc.emit(AppEvent::LoadFailed(
                         thread_id,
                         format!("Couldn't load messages: {}", err_text(&e)),
                     ));
@@ -1126,7 +1274,7 @@ impl Service {
                     svc.emit(AppEvent::OlderLoaded(thread_id, messages, cursor, has_more));
                 }
                 Err(e) => {
-                    svc.emit(AppEvent::SendFailed(
+                    svc.emit(AppEvent::LoadFailed(
                         thread_id,
                         format!("Couldn't load older messages: {}", err_text(&e)),
                     ));
@@ -1219,6 +1367,13 @@ impl Service {
     pub fn send_photo(&self, thread_id: String, path: PathBuf) {
         let svc = self.clone();
         self.spawn(async move {
+            let path = match svc.checked_upload_path(path).await {
+                Ok(path) => path,
+                Err(e) => {
+                    svc.emit(AppEvent::SendFailed(thread_id, e));
+                    return;
+                }
+            };
             svc.send_photo_impl(thread_id, path).await;
         });
     }
@@ -1227,7 +1382,14 @@ impl Service {
     pub fn send_photo_bytes(&self, thread_id: String, data: Vec<u8>, ext: String) {
         let svc = self.clone();
         self.spawn(async move {
-            let path = match write_temp_media("Pasted image", &data, &ext) {
+            // A pasted image can be up to 20 MB; writing it inline would block
+            // a tokio worker for the whole write.
+            let path = match tokio::task::spawn_blocking(move || {
+                write_temp_media("Pasted image", &data, &ext)
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("Could not save the pasted image: {e}")))
+            {
                 Ok(p) => p,
                 Err(e) => {
                     svc.emit(AppEvent::SendFailed(thread_id, e));
@@ -1284,6 +1446,13 @@ impl Service {
     pub fn send_video(&self, thread_id: String, path: PathBuf) {
         let svc = self.clone();
         self.spawn(async move {
+            let path = match svc.checked_upload_path(path).await {
+                Ok(path) => path,
+                Err(e) => {
+                    svc.emit(AppEvent::SendFailed(thread_id, e));
+                    return;
+                }
+            };
             let viewer = svc
                 .client
                 .user_id()
@@ -1309,7 +1478,12 @@ impl Service {
     pub fn send_voice(&self, thread_id: String, data: Vec<u8>, ext: String) {
         let svc = self.clone();
         self.spawn(async move {
-            let path = match write_temp_media("Voice recording", &data, &ext) {
+            let path = match tokio::task::spawn_blocking(move || {
+                write_temp_media("Voice recording", &data, &ext)
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("Could not save the recording: {e}")))
+            {
                 Ok(p) => p,
                 Err(e) => {
                     svc.emit(AppEvent::SendFailed(thread_id, e));
@@ -1389,7 +1563,16 @@ impl Service {
             // peer's read state arrives reliably as `has_seen` patches on
             // topic 146 regardless.
             if !item_id.is_empty() {
-                if let Err(e) = svc.client.direct_message_seen(&thread_id, &item_id).await {
+                let seen = match (
+                    checked_thread_id(&thread_id),
+                    checked_id("item id", &item_id),
+                ) {
+                    (Ok(thread_id), Ok(item_id)) => {
+                        svc.client.direct_message_seen(thread_id, item_id).await
+                    }
+                    (Err(e), _) | (_, Err(e)) => Err(e),
+                };
+                if let Err(e) = seen {
                     log::error!(
                         "[igdm] mark_seen failed (thread {thread_id}, item {item_id}): {e}"
                     );
@@ -1454,7 +1637,11 @@ impl Service {
     pub fn approve_request(&self, thread_id: String) {
         let svc = self.clone();
         self.spawn(async move {
-            match svc.client.direct_request_approve(&thread_id).await {
+            let result = match checked_thread_id(&thread_id) {
+                Ok(thread_id) => svc.client.direct_request_approve(thread_id).await,
+                Err(e) => Err(e),
+            };
+            match result {
                 Ok(true) => svc.emit(AppEvent::Approved(thread_id)),
                 Ok(false) => svc.emit(AppEvent::SendFailed(
                     thread_id,
@@ -1471,6 +1658,16 @@ impl Service {
     pub fn download_media(&self, url: String) {
         let svc = self.clone();
         self.spawn(async move {
+            // Same guard as `fetch_image`: the URL comes from message payloads
+            // rendered by the webview, and an unrestricted fetch would turn this
+            // into an SSRF primitive (and a way to write arbitrary remote
+            // content into the media cache).
+            if !instagrapi::client::is_instagram_host(&url) {
+                svc.emit(AppEvent::MediaFailed(format!(
+                    "refusing to download non-Instagram url: {url}"
+                )));
+                return;
+            }
             let cache = svc.sessions_dir.join("media");
             let _ = std::fs::create_dir_all(&cache);
             match svc.client.download_media(&url, &cache).await {

@@ -59,6 +59,12 @@ pub struct SessionState {
     /// `ig-set-authorization` header from the most recent response (consumed
     /// by the login flows; not persisted).
     pub last_set_authorization: Option<String>,
+    /// Generated `csrftoken`, used only until the server sets the cookie.
+    /// Memoized so every request before that point signs with the same value
+    /// (upstream caches it in `self._token`); regenerating per call also made
+    /// the token useless for matching a request to its response. Not
+    /// persisted — the session JSON matches instagrapi's byte for byte.
+    pub csrf_token: Option<String>,
 }
 
 impl SessionState {
@@ -175,11 +181,11 @@ impl SessionState {
             .filter(|s| !s.is_empty())
     }
 
-    pub fn token(&self) -> String {
-        self.cookies
-            .get("csrftoken")
-            .cloned()
-            .unwrap_or_else(|| gen_token(64))
+    pub fn token(&mut self) -> String {
+        if let Some(cookie) = self.cookies.get("csrftoken") {
+            return cookie.clone();
+        }
+        self.csrf_token.get_or_insert_with(|| gen_token(64)).clone()
     }
 
     pub fn bloks_versioning_id(&self) -> String {
@@ -521,8 +527,7 @@ impl Client {
         // `send_with_retry` borrows the body (cloning only per attempt); the
         // original stays here so the post-challenge re-send below has it.
         let challenge_json = {
-            let mut state = self.inner.state.lock().await;
-            match self.send_with_retry(&mut state, endpoint, &body, req).await {
+            match self.send_with_retry(endpoint, &body, req).await {
                 Ok(json) => return Ok(json),
                 Err(e) if e.is(ErrorKind::ChallengeRequired) => e.json,
                 Err(e) => return Err(e),
@@ -535,34 +540,39 @@ impl Client {
     }
 
     /// `send_private_request` plus timeout / incomplete-read retries.
+    ///
+    /// The state guard is re-acquired per attempt rather than held across the
+    /// backoff sleeps: the mutex is the client-wide lock, so sleeping 60s
+    /// under it would freeze every other request (sends, read receipts, the
+    /// realtime keepalive) for a minute.
     /// The body is borrowed so the caller keeps the original for a possible
     /// post-challenge re-send; each attempt clones it (retries are rare).
     pub(crate) async fn send_with_retry(
         &self,
-        state: &mut SessionState,
         endpoint: &str,
         body: &Option<Body>,
         req: Req<'_>,
     ) -> Result<Value> {
-        match self
-            .send_private_request(state, endpoint, body.clone(), req)
-            .await
-        {
-            Ok(json) => Ok(json),
+        let first = {
+            let mut state = self.inner.state.lock().await;
+            self.send_private_request(&mut state, endpoint, body.clone(), req)
+                .await
+        };
+        let wait = match &first {
             Err(e) if e.is(ErrorKind::ClientRequestTimeout) => {
                 log::info!("Wait 60 seconds and try one more time (ClientRequestTimeout)");
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                self.send_private_request(state, endpoint, body.clone(), req)
-                    .await
+                Duration::from_secs(60)
             }
             Err(e) if e.is(ErrorKind::ClientIncompleteReadError) => {
                 log::info!("Wait 2 seconds and try one more time (ClientIncompleteReadError)");
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                self.send_private_request(state, endpoint, body.clone(), req)
-                    .await
+                Duration::from_secs(2)
             }
-            Err(e) => Err(e),
-        }
+            _ => return first,
+        };
+        tokio::time::sleep(wait).await;
+        let mut state = self.inner.state.lock().await;
+        self.send_private_request(&mut state, endpoint, body.clone(), req)
+            .await
     }
 
     pub(crate) async fn send_private_request(
@@ -596,10 +606,10 @@ impl Client {
         }
         let auth = self.authorization_header(state).await;
         if !auth.is_empty() && !request_headers.contains_key("authorization") {
-            request_headers.insert("authorization", HeaderValue::from_str(&auth).unwrap());
+            request_headers.insert("authorization", header_value("authorization", &auth)?);
         }
         if let Some(cookie) = cookie_header(&state.cookies) {
-            request_headers.insert(COOKIE, HeaderValue::from_str(&cookie).unwrap());
+            request_headers.insert(COOKIE, header_value("Cookie", &cookie)?);
         }
 
         let method = if body.is_some() {
@@ -695,7 +705,26 @@ impl Client {
         let text = response.text().await.unwrap_or_default();
         log::debug!("private_request {endpoint} ({status})");
 
-        let last_json: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        // A body that is present but unparsable (proxy/captive portal HTML, a
+        // truncated response) must not masquerade as a successful `null`
+        // payload: it would overwrite `last_json` (which the challenge and
+        // realtime paths read) and surface as a misleading "missing payload"
+        // error at the call site. Error responses keep the HTTP-status mapping
+        // below, which is what the login flow keys off (429 → throttled).
+        let last_json = if text.trim().is_empty() {
+            Value::Null
+        } else {
+            match serde_json::from_str(&text) {
+                Ok(json) => json,
+                Err(e) if status.is_success() => {
+                    return Err(IgError::new(
+                        ErrorKind::ClientJSONDecodeError,
+                        format!("JSONDecodeError while opening {endpoint}: {e}"),
+                    ));
+                }
+                Err(_) => Value::Null,
+            }
+        };
         state.last_json = last_json;
 
         if !status.is_success() {
@@ -752,9 +781,23 @@ impl Client {
         Ok(state.last_json.clone())
     }
 
-    /// Public GET used for password encryption keys (`qe/sync`).
+    /// Public GET used for password encryption keys (`qe/sync`), `<img>`
+    /// fallbacks and media downloads.
+    ///
+    /// The sessionid cookie is only attached to Instagram-owned hosts: the
+    /// URL can originate from message payloads rendered by the webview, and
+    /// sending the session token to an arbitrary host would hand the account
+    /// to whoever controls that URL.
     pub async fn public_get(&self, url: &str) -> Result<(u16, HeaderMap, Vec<u8>)> {
-        let state = self.inner.state.lock().await;
+        // Read what we need out of the state guard and drop it before the
+        // request: holding it across network I/O would freeze every other
+        // `state()`/`private_request` caller (the mutex is not reentrant).
+        let sessionid = if is_instagram_host(url) {
+            let state = self.inner.state.lock().await;
+            state.sessionid()
+        } else {
+            None
+        };
         let mut headers = HeaderMap::new();
         headers.insert("Connection", HeaderValue::from_static("Keep-Alive"));
         headers.insert("Accept", HeaderValue::from_static("*/*"));
@@ -762,30 +805,49 @@ impl Client {
         headers.insert("Accept-Language", HeaderValue::from_static("en-US"));
         headers.insert(
             "User-Agent",
-            HeaderValue::from_str(
+            HeaderValue::from_static(
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_6) AppleWebKit/605.1.15 \
                  (KHTML, like Gecko) Version/11.1.2 Safari/605.1.15",
-            )
-            .unwrap(),
+            ),
         );
-        if let Some(sessionid) = state.sessionid() {
+        if let Some(sessionid) = sessionid {
             if let Ok(v) = HeaderValue::from_str(&format!("sessionid={sessionid}")) {
                 headers.insert(COOKIE, v);
             }
         }
-        let response = self
-            .inner
-            .http
-            .get(url)
-            .headers(headers)
-            .send()
-            .await
-            .map_err(IgError::from)?;
+        let response = tokio::time::timeout(
+            Duration::from_secs(30),
+            self.inner.http.get(url).headers(headers).send(),
+        )
+        .await
+        .map_err(|_| IgError::new(ErrorKind::ClientRequestTimeout, "Request timed out"))?
+        .map_err(IgError::from)?;
         let status = response.status().as_u16();
         let headers = response.headers().clone();
         let bytes = response.bytes().await.map_err(IgError::from)?.to_vec();
         Ok((status, headers, bytes))
     }
+}
+
+/// True for hosts that may receive the Instagram sessionid cookie.
+///
+/// Matches the domain itself and its subdomains (`instagram.com`,
+/// `i.instagram.com`, `scontent.cdninstagram.com`, `…fbcdn.net`). A leading
+/// dot is required so lookalikes such as `xinstagram.com` are rejected.
+pub fn is_instagram_host(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() != "https" {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    const DOMAINS: [&str; 3] = ["instagram.com", "cdninstagram.com", "fbcdn.net"];
+    DOMAINS
+        .iter()
+        .any(|d| host == *d || host.ends_with(&format!(".{d}")))
 }
 
 fn message_text(value: &Value) -> String {
@@ -1045,6 +1107,14 @@ fn encode_query(params: &Map<String, Value>) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Build a header value, mapping an invalid one to a client error instead of
+/// panicking: locale, country, device ids, user agent and mid all come from the
+/// session file, which a user or another tool can write by hand.
+fn header_value(name: &str, value: &str) -> Result<HeaderValue> {
+    HeaderValue::from_str(value)
+        .map_err(|e| IgError::client_error(format!("invalid {name} header: {e}")))
+}
+
 fn build_base_headers(state: &SessionState) -> Result<HeaderMap> {
     let mut headers = HeaderMap::new();
     let locale = state.locale.replace('-', "_");
@@ -1062,42 +1132,54 @@ fn build_base_headers(state: &SessionState) -> Result<HeaderMap> {
     let pigeon = generate_uuid_prefix("UFS-", "-1");
     let now_f = now();
     let user_id = state.user_id();
-    headers.insert("X-IG-App-Locale", HeaderValue::from_str(&locale).unwrap());
+    headers.insert("X-IG-App-Locale", header_value("X-IG-App-Locale", &locale)?);
     headers.insert(
         "X-IG-Device-Locale",
-        HeaderValue::from_str(&locale).unwrap(),
+        header_value("X-IG-App-Locale", &locale)?,
     );
     headers.insert(
         "X-IG-Mapped-Locale",
-        HeaderValue::from_str(&locale).unwrap(),
+        header_value("X-IG-App-Locale", &locale)?,
     );
     headers.insert(
         "X-Pigeon-Session-Id",
-        HeaderValue::from_str(&pigeon).unwrap(),
+        header_value("X-Pigeon-Session-Id", &pigeon)?,
     );
     headers.insert(
         "X-Pigeon-Rawclienttime",
-        HeaderValue::from_str(&format!("{:.3}", now_f as f64 + 0.123)).unwrap(),
+        header_value(
+            "X-Pigeon-Rawclienttime",
+            &format!("{:.3}", now_f as f64 + 0.123),
+        )?,
     );
     headers.insert(
         "X-IG-Bandwidth-Speed-KBPS",
-        HeaderValue::from_str(&format!("{:.3}", 2500.0 + (now_f % 500) as f64 / 1000.0)).unwrap(),
+        header_value(
+            "X-IG-Bandwidth-Speed-KBPS",
+            &format!("{:.3}", 2500.0 + (now_f % 500) as f64 / 1000.0),
+        )?,
     );
     headers.insert(
         "X-IG-Bandwidth-TotalBytes-B",
-        HeaderValue::from_str(&format!("{}", 5_000_000 + (now_f % 85_000_000))).unwrap(),
+        header_value(
+            "X-IG-Bandwidth-TotalBytes-B",
+            &format!("{}", 5_000_000 + (now_f % 85_000_000)),
+        )?,
     );
     headers.insert(
         "X-IG-Bandwidth-TotalTime-MS",
-        HeaderValue::from_str(&format!("{}", 2_000 + (now_f % 7_000))).unwrap(),
+        header_value(
+            "X-IG-Bandwidth-TotalTime-MS",
+            &format!("{}", 2_000 + (now_f % 7_000)),
+        )?,
     );
     headers.insert(
         "X-IG-App-Startup-Country",
-        HeaderValue::from_str(&state.country.to_uppercase()).unwrap(),
+        header_value("X-IG-App-Startup-Country", &state.country.to_uppercase())?,
     );
     headers.insert(
         "X-Bloks-Version-Id",
-        HeaderValue::from_str(&state.bloks_versioning_id()).unwrap(),
+        header_value("X-Bloks-Version-Id", &state.bloks_versioning_id())?,
     );
     headers.insert("X-IG-WWW-Claim", HeaderValue::from_static("0"));
     headers.insert("X-Bloks-Is-Layout-RTL", HeaderValue::from_static("false"));
@@ -1107,37 +1189,34 @@ fn build_base_headers(state: &SessionState) -> Result<HeaderMap> {
     );
     headers.insert(
         "X-IG-Device-ID",
-        HeaderValue::from_str(&state.uuid).unwrap(),
+        header_value("X-IG-Device-ID", &state.uuid)?,
     );
     headers.insert(
         "X-IG-Family-Device-ID",
-        HeaderValue::from_str(&state.phone_id).unwrap(),
+        header_value("X-IG-Family-Device-ID", &state.phone_id)?,
     );
     headers.insert(
         "X-IG-Android-ID",
-        HeaderValue::from_str(&state.android_device_id).unwrap(),
+        header_value("X-IG-Android-ID", &state.android_device_id)?,
     );
     headers.insert(
         "X-IG-Timezone-Offset",
-        HeaderValue::from_str(&state.timezone_offset.to_string()).unwrap(),
+        header_value("X-IG-Timezone-Offset", &state.timezone_offset.to_string())?,
     );
     headers.insert("X-IG-Connection-Type", HeaderValue::from_static("WIFI"));
     headers.insert("X-IG-Capabilities", HeaderValue::from_static("3brTv10="));
     headers.insert("X-IG-App-ID", HeaderValue::from_static(config::APP_ID));
     headers.insert("Priority", HeaderValue::from_static("u=3"));
-    headers.insert(
-        "User-Agent",
-        HeaderValue::from_str(&state.user_agent).unwrap(),
-    );
+    headers.insert("User-Agent", header_value("User-Agent", &state.user_agent)?);
     headers.insert(
         "Accept-Language",
         if accept_language.len() == 1 {
             HeaderValue::from_static("en-US")
         } else {
-            HeaderValue::from_str(&accept_language.join(", ")).unwrap()
+            header_value("Accept-Language", &accept_language.join(", "))?
         },
     );
-    headers.insert("X-MID", HeaderValue::from_str(&state.mid).unwrap());
+    headers.insert("X-MID", header_value("X-MID", &state.mid)?);
     headers.insert("Accept-Encoding", HeaderValue::from_static("gzip, deflate"));
     headers.insert("Host", HeaderValue::from_static(config::API_DOMAIN));
     headers.insert(
@@ -1157,7 +1236,7 @@ fn build_base_headers(state: &SessionState) -> Result<HeaderMap> {
     headers.insert("X-FB-Server-Cluster", HeaderValue::from_static("True"));
     headers.insert(
         "IG-INTENDED-USER-ID",
-        HeaderValue::from_str(&user_id.unwrap_or(0).to_string()).unwrap(),
+        header_value("IG-INTENDED-USER-ID", &user_id.unwrap_or(0).to_string())?,
     );
     headers.insert(
         "X-IG-Nav-Chain",
@@ -1167,51 +1246,50 @@ fn build_base_headers(state: &SessionState) -> Result<HeaderMap> {
     );
     headers.insert(
         "X-IG-SALT-IDS",
-        HeaderValue::from_str(&format!("{}", 1061162222 + (now_f % 100_000))).unwrap(),
+        header_value(
+            "X-IG-SALT-IDS",
+            &format!("{}", 1061162222 + (now_f % 100_000)),
+        )?,
     );
     if let Some(user_id) = user_id {
         let next_year = now_f + 31_536_000;
         headers.insert(
             "IG-U-DS-USER-ID",
-            HeaderValue::from_str(&user_id.to_string()).unwrap(),
+            header_value("IG-U-DS-USER-ID", &user_id.to_string())?,
         );
         headers.insert(
             "IG-U-IG-DIRECT-REGION-HINT",
-            HeaderValue::from_str(&format!(
+            header_value("IG-U-IG-DIRECT-REGION-HINT", &format!(
                 "LLA,{user_id},{next_year}:01f7bae7d8b131877d8e0ae1493252280d72f6d0d554447cb1dc9049b6b2c507c08605b7"
-            ))
-            .unwrap(),
+            ))?,
         );
         headers.insert(
             "IG-U-SHBID",
-            HeaderValue::from_str(&format!(
+            header_value("IG-U-SHBID", &format!(
                 "12695,{user_id},{next_year}:01f778d9c9f7546cf3722578fbf9b85143cd6e5132723e5c93f40f55ca0459c8ef8a0d9f"
-            ))
-            .unwrap(),
+            ))?,
         );
         headers.insert(
             "IG-U-SHBTS",
-            HeaderValue::from_str(&format!(
+            header_value("IG-U-SHBTS", &format!(
                 "{},{user_id},{next_year}:01f7ace11925d0388080078d0282b75b8059844855da27e23c90a362270fddfb3fae7e28",
                 now_f
-            ))
-            .unwrap(),
+            ))?,
         );
         headers.insert(
             "IG-U-RUR",
-            HeaderValue::from_str(&format!(
+            header_value("IG-U-RUR", &format!(
                 "RVA,{user_id},{next_year}:01f7f627f9ae4ce2874b2e04463efdb184340968b1b006fa88cb4cc69a942a04201e544c"
-            ))
-            .unwrap(),
+            ))?,
         );
     }
     if !state.ig_u_rur.is_empty() {
-        headers.insert("IG-U-RUR", HeaderValue::from_str(&state.ig_u_rur).unwrap());
+        headers.insert("IG-U-RUR", header_value("IG-U-RUR", &state.ig_u_rur)?);
     }
     if !state.ig_www_claim.is_empty() {
         headers.insert(
             "X-IG-WWW-Claim",
-            HeaderValue::from_str(&state.ig_www_claim).unwrap(),
+            header_value("X-IG-WWW-Claim", &state.ig_www_claim)?,
         );
     }
     Ok(headers)

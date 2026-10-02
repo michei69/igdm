@@ -27,12 +27,5 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 percent-encoding = "2"
 futures-util = "0.3"
 
-# tao 0.36.0 fixes forced client-side decorations on Wayland
-# (tao-apps/tao#1046, tauri#12955, tauri#12685), but tauri 2.11.5 pins
-# tao = "0.35". Vendor the 0.35.3 tree with the upstream 0.36.0 window.rs
-# change applied. Remove once tauri >= 2.12 (tao 0.36) is released.
-[patch.crates-io]
-tao = { path = "vendor/tao" }
-
 [profile.release]
 lto = true

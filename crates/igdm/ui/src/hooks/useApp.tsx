@@ -84,6 +84,9 @@ function runEffect(effect: Effect): void {
     case "thread_details":
       api.threadDetails(effect.threadId);
       break;
+    case "load_messages":
+      api.loadMessages(effect.threadId, effect.amount);
+      break;
     case "mark_seen":
       api.markSeen(effect.threadId, effect.itemId, effect.raw);
       break;
@@ -151,10 +154,19 @@ const downloadMedia = (url: string) => api.downloadMedia(url);
 
 export function AppProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<AppState>(defaultAppState);
+  // `stateRef` is the authoritative state; React state mirrors it. Both the
+  // UI mutations below and the backend-event handler in the subscription
+  // effect advance the ref *before* committing, so an event that arrives in
+  // the same tick as a user action (a click that opens a thread while
+  // `ThreadsLoaded` lands) reduces against the state that action produced
+  // instead of the previous render's — which used to silently discard the
+  // action, since the event handler committed an absolute value.
   const stateRef = useRef(state);
-  useEffect(() => {
-    stateRef.current = state;
-  }, [state]);
+  const mutate = useCallback((fn: (s: AppState) => AppState) => {
+    const next = fn(stateRef.current);
+    stateRef.current = next;
+    setState(next);
+  }, []);
   // React StrictMode dev re-runs the bootstrap effect; the guard keeps the
   // launch resume (a live login) from firing twice.
   const autoLoginRef = useRef(false);
@@ -190,7 +202,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
           .getBootstrap()
           .then((b) => {
             if (disposed) return;
-            setState((s) => ({
+            mutate((s) => ({
               ...s,
               savedSessions: b.saved_sessions,
               reactionEmojis: b.reaction_emojis.length === 5 ? b.reaction_emojis : s.reactionEmojis,
@@ -209,7 +221,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
                 loginSaved(last);
               }
             } else {
-              setState((s) => ({ ...s, screen: "login" }));
+              mutate((s) => ({ ...s, screen: "login" }));
             }
           })
           .catch((err) => {
@@ -217,14 +229,14 @@ export function AppProvider({ children }: { children: ReactNode }) {
               "bootstrap failed: saved sessions, reaction emojis, and theme were not loaded",
               err,
             );
-            if (!disposed) setState((s) => ({ ...s, screen: "login" }));
+            if (!disposed) mutate((s) => ({ ...s, screen: "login" }));
           });
       })
       .catch((err) => {
         // If the event channel can't be established, don't hang the boot
         // splash — surface the login screen instead.
         console.error("event subscription failed:", err);
-        if (!disposed) setState((s) => ({ ...s, screen: "login" }));
+        if (!disposed) mutate((s) => ({ ...s, screen: "login" }));
       });
 
     // Theme/chat-theme changes from the Settings window (broadcast by the backend).
@@ -237,7 +249,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     });
     listen<boolean>("igdm://chat-themes", (e) => {
       if (disposed) return;
-      setState((s) => ({ ...s, chatThemesEnabled: e.payload }));
+      mutate((s) => ({ ...s, chatThemesEnabled: e.payload }));
     }).then((u) => {
       if (disposed) u();
       else unlistenChatThemes = u;
@@ -252,7 +264,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const setSearch = useCallback((query: string) => {
-    setState((s) => ({
+    mutate((s) => ({
       ...s,
       searchQuery: query,
       showSearch: query.trim().length > 0,
@@ -261,7 +273,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const clearSearch = useCallback(() => {
-    setState((s) => ({
+    mutate((s) => ({
       ...s,
       searchQuery: "",
       searchResults: [],
@@ -271,31 +283,31 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const setReply = useCallback((reply: ReplyInfo | null) => {
-    setState((s) => ({ ...s, reply }));
+    mutate((s) => ({ ...s, reply }));
   }, []);
 
   const setReplyScroll = useCallback((msgId: string | null, retries: number) => {
-    setState((s) => ({ ...s, replyScroll: msgId, replyRetries: retries }));
+    mutate((s) => ({ ...s, replyScroll: msgId, replyRetries: retries }));
   }, []);
 
   const refreshInbox = useCallback(() => {
-    setState((s) => ({ ...s, inboxLoading: true }));
+    mutate((s) => ({ ...s, inboxLoading: true }));
     api.refreshInbox();
   }, []);
 
   // `busy` is set here and cleared only by the reducer (LoggedIn/LoginError/CodePrompt).
   const loginPassword = useCallback((username: string, password: string) => {
-    setState((s) => ({ ...s, login: { ...s.login, busy: true, error: "" } }));
+    mutate((s) => ({ ...s, login: { ...s.login, busy: true, error: "" } }));
     api.loginPassword(username, password);
   }, []);
 
   const loginSessionid = useCallback((sessionid: string) => {
-    setState((s) => ({ ...s, login: { ...s.login, busy: true, error: "" } }));
+    mutate((s) => ({ ...s, login: { ...s.login, busy: true, error: "" } }));
     api.loginSessionid(sessionid);
   }, []);
 
   const loginSaved = useCallback((name: string) => {
-    setState((s) => ({
+    mutate((s) => ({
       ...s,
       login: { ...s.login, busy: true, error: "", pendingSession: name },
     }));
@@ -304,11 +316,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   const saveReactionEmojis = useCallback((emojis: string[]) => {
     api.saveReactionEmojis(emojis);
-    setState((s) => ({ ...s, reactionEmojis: emojis }));
+    mutate((s) => ({ ...s, reactionEmojis: emojis }));
   }, []);
 
   const mutateThread = useCallback((key: string, fn: (ts: ThreadState) => ThreadState) => {
-    setState((s) => {
+    mutate((s) => {
       const threads = { ...s.threads };
       if (threads[key]) threads[key] = fn(threads[key]);
       return { ...s, threads };
@@ -338,7 +350,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
           last_activity: tsMillis(echo) / 1000,
         };
       });
-      setState((s) => {
+      mutate((s) => {
         if (!isOpen) return s;
         return { ...s, reply: s.reply && s.reply.threadKey === threadId ? null : s.reply };
       });
@@ -348,7 +360,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   );
 
   const openThread = useCallback((key: string) => {
-    setState((s) => {
+    mutate((s) => {
       const threads = { ...s.threads };
       const ts = threads[key];
       if (ts) {
@@ -359,7 +371,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const openPendingThread = useCallback((key: string) => {
-    setState((s) => {
+    mutate((s) => {
       const threads = { ...s.threads };
       if (!threads[key]) {
         threads[key] = { ...emptyThreadState(key), pending: true };

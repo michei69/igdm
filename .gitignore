@@ -16,3 +16,12 @@ node_modules/
 # bun install cache / temp dirs
 .bun-install/
 .bun-tmp/
+
+# Flatpak (manifest is committed; staging + build output are generated)
+flatpak/stage/
+flatpak/build-dir/
+flatpak/repo/
+flatpak/.flatpak-builder/
+
+# Local bundle output (scripts/build-flatpak.sh)
+dist/

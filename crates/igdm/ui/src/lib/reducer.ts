@@ -33,6 +33,7 @@ import {
 export type Effect =
   | { kind: "refresh_inbox" }
   | { kind: "thread_details"; threadId: string }
+  | { kind: "load_messages"; threadId: string; amount: number }
   | { kind: "mark_seen"; threadId: string; itemId: string; raw?: Json }
   | { kind: "load_older"; threadId: string; cursor: string }
   | { kind: "reveal_media"; path: string }
@@ -92,6 +93,24 @@ function mergeIncoming(
   return [...messages, msg];
 }
 
+/**
+ * `mergeIncoming` followed by a sort — but skipping the sort when the message
+ * was simply appended in order. That is the common case on the live-message
+ * path, where an O(n log n) copy of the whole thread was previously paid for
+ * every incoming message.
+ */
+function mergeIncomingSorted(
+  messages: DirectMessage[],
+  msg: DirectMessage,
+  opts: { localText?: string | null; keepReply?: boolean },
+): DirectMessage[] {
+  const last = messages[messages.length - 1];
+  const appendedInOrder = last !== undefined && tsMillis(msg) >= tsMillis(last);
+  const merged = mergeIncoming(messages, msg, opts);
+  if (appendedInOrder && merged.length === messages.length + 1) return merged;
+  return merged.toSorted((a, b) => tsMillis(a) - tsMillis(b));
+}
+
 /** Merge a DirectThread into local state. */
 function upsertThread(state: AppState, thread: DirectThread, meta?: ThreadMeta): AppState {
   const key = thread.id;
@@ -118,7 +137,10 @@ function upsertThread(state: AppState, thread: DirectThread, meta?: ThreadMeta):
   if (!existing.loaded) {
     ts = sortMessages({ ...ts, messages: thread.messages, loaded: true });
   }
-  ts = { ...ts, unread: unreadFor(ts, state.me.user_id) };
+  // `read_state`/`last_seen_at` lag behind the read receipt the viewer just
+  // sent, so recomputing the flag for the thread on screen would re-dot the
+  // conversation the user is reading.
+  ts = { ...ts, unread: key === state.openKey ? false : unreadFor(ts, state.me.user_id) };
   return withThread(state, key, () => ts);
 }
 
@@ -261,11 +283,11 @@ export function applyEvent(state: AppState, event: AppEvent): ReducerResult {
             // reactions list): never a message row, never a read receipt.
           } else {
             const knownInThread = t.messages.some((m) => m.id === msg.id);
-            t = sortMessages({
+            t = {
               ...t,
-              messages: mergeIncoming(t.messages, msg, { localText: own ? live.text : null }),
+              messages: mergeIncomingSorted(t.messages, msg, { localText: own ? live.text : null }),
               last_activity: tsMillis(msg) / 1000,
-            });
+            };
             if (!own && !knownInThread) {
               t = { ...t, unread: true };
             }
@@ -428,46 +450,86 @@ export function applyEvent(state: AppState, event: AppEvent): ReducerResult {
     case "Sent": {
       const { key, realThreadId, msg } = event;
       let next = state;
+      let key2 = key;
       if (key.startsWith("user:")) {
         const virtual = next.threads[key];
         if (virtual) {
+          // Promote the virtual thread onto its real id, keeping the messages
+          // already in it: `[msg]` used to throw away other pending echoes
+          // (and the real thread's history) as well as this send's context.
           const threads = { ...next.threads };
-          const existingReal = threads[realThreadId] ?? emptyThreadState(realThreadId);
-          const promoted: ThreadState = {
-            ...existingReal,
-            title: existingReal.title || virtual.title,
-            users: existingReal.users.length > 0 ? existingReal.users : virtual.users,
-            messages: [msg],
+          const existingReal = threads[realThreadId];
+          const base = existingReal ?? emptyThreadState(realThreadId);
+          const promoted: ThreadState = sortMessages({
+            ...base,
+            title: base.title || virtual.title,
+            users: base.users.length > 0 ? base.users : virtual.users,
+            messages: mergeIncoming([...base.messages, ...virtual.messages], msg, {
+              localText: msg.text,
+              keepReply: true,
+            }),
             loaded: true,
+            oldest_cursor: base.oldest_cursor,
+            has_more: base.has_more,
             last_activity: tsMillis(msg) / 1000,
-          };
+          });
           delete threads[key];
           threads[realThreadId] = promoted;
           next = { ...next, threads };
+          next = { ...next, openKey: realThreadId };
+          effects.push({ kind: "refresh_inbox" });
+          return { state: { ...next, inboxLoading: true }, effects };
         }
-        next = { ...next, openKey: realThreadId };
-        effects.push({ kind: "refresh_inbox" });
-        return { state: { ...next, inboxLoading: true }, effects };
+        // The virtual thread is already gone (a second `Sent` for the same
+        // send, or the promotion above ran first): fall through to the normal
+        // path so the message still lands in the real thread instead of
+        // vanishing.
+        key2 = realThreadId;
       }
-      if (!next.threads[key]) return { state, effects };
-      next = withThread(next, key, (ts) =>
-        sortMessages({
-          ...ts,
-          messages: mergeIncoming(ts.messages, msg, { localText: msg.text, keepReply: true }),
-          last_activity: tsMillis(msg) / 1000,
+      const target = next.threads[key2];
+      if (!target) return { state, effects };
+      next = withThread(next, key2, (ts) => ({
+        ...ts,
+        messages: mergeIncomingSorted(ts.messages, msg, {
+          localText: msg.text,
+          keepReply: true,
         }),
-      );
+        last_activity: tsMillis(msg) / 1000,
+      }));
       return { state: next, effects };
     }
 
     case "SendFailed": {
       if (!state.threads[event.key]) return { state, effects };
-      const next = withThread(state, event.key, (ts) => ({
-        ...ts,
-        messages: ts.messages.filter((m) => !m.id.startsWith("local:")),
-      }));
+      // Drop only the echo that failed: the pending echoes are in send order,
+      // so the last one is the message this failure belongs to. Removing every
+      // `local:` row used to delete other in-flight sends as well.
+      const next = withThread(state, event.key, (ts) => {
+        const idx = ts.messages.findLastIndex((m) => m.id.startsWith("local:"));
+        if (idx === -1) return ts;
+        const messages = [...ts.messages];
+        messages.splice(idx, 1);
+        return { ...ts, messages };
+      });
       effects.push({ kind: "toast", text: `Send failed: ${event.text}` });
       return { state: next, effects };
+    }
+
+    case "LoadFailed": {
+      // History failures carry no optimistic echo; clear the in-flight latches
+      // so the thread can try again (they used to stay set forever, leaving
+      // "Loading earlier messages…" on screen and blocking pagination).
+      const ts = state.threads[event.key];
+      effects.push({ kind: "toast", text: event.text });
+      if (!ts) return { state, effects };
+      return {
+        state: withThread(state, event.key, (t) => ({
+          ...t,
+          loading_older: false,
+          meta_fetching: false,
+        })),
+        effects,
+      };
     }
 
     case "SearchResults": {
@@ -485,7 +547,8 @@ export function applyEvent(state: AppState, event: AppEvent): ReducerResult {
       const { user, threadId } = event;
       let next = state;
       if (threadId) {
-        if (!next.threads[threadId]) {
+        const known = next.threads[threadId];
+        if (!known) {
           effects.push({ kind: "refresh_inbox" });
           next = withThread(next, threadId, () => ({
             ...emptyThreadState(threadId),
@@ -496,6 +559,12 @@ export function applyEvent(state: AppState, event: AppEvent): ReducerResult {
           next = { ...next, inboxLoading: true };
         }
         next = { ...next, openKey: threadId };
+        // A thread upserted by an inbox refresh carries no message page of its
+        // own, so opening it from search would render an empty pane forever:
+        // only Sidebar's row click ever requested page one.
+        if (!known?.oldest_cursor) {
+          effects.push({ kind: "load_messages", threadId, amount: 30 });
+        }
       } else {
         const key = `user:${user.pk}`;
         next = withThread(next, key, () => ({

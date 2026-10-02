@@ -109,8 +109,14 @@ pub fn thread_details(state: State<'_, SharedService>, thread_id: String) {
     let svc = state.inner().clone();
     let thread_id2 = thread_id.clone();
     tauri::async_runtime::spawn(async move {
-        if let Ok((thread, meta, _raw)) = svc.thread_details(&thread_id).await {
-            svc.emit_thread_details(thread_id2, thread, meta);
+        // Failures used to be dropped entirely: an expired session or a rate
+        // limit left the chat stuck on its loading state with no explanation.
+        match svc.thread_details(&thread_id).await {
+            Ok((thread, meta, _raw)) => svc.emit_thread_details(thread_id2, thread, meta),
+            Err(e) => svc.emit_load_failed(
+                thread_id2,
+                format!("Couldn't load thread: {}", crate::service::err_text(&e)),
+            ),
         }
     });
 }
@@ -213,6 +219,51 @@ pub fn send_photo(state: State<'_, SharedService>, thread_id: String, path: Stri
     state.send_photo(thread_id, std::path::PathBuf::from(path));
 }
 
+/// Native file picker for photo/video attachments.
+///
+/// The selection happens in the backend so the chosen path is the only thing
+/// the send commands accept — a renderer-side dialog result would be
+/// indistinguishable from an arbitrary path supplied by a compromised webview.
+#[tauri::command]
+pub async fn pick_media(
+    app: tauri::AppHandle,
+    state: State<'_, SharedService>,
+) -> Result<Option<String>, String> {
+    use tauri::Manager as _;
+    use tauri_plugin_dialog::DialogExt as _;
+
+    // `blocking_pick_file` parks the calling thread until the user answers, so
+    // it must not run on an async worker.
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        let parent = app.get_webview_window("main");
+        let mut dialog = app
+            .dialog()
+            .file()
+            .set_title("Attach media")
+            .add_filter("Images and videos", &MEDIA_EXTS);
+        if let Some(parent) = parent.as_ref() {
+            dialog = dialog.set_parent(parent);
+        }
+        dialog.blocking_pick_file()
+    })
+    .await
+    .map_err(|e| format!("File picker failed: {e}"))?;
+
+    let Some(picked) = picked else {
+        return Ok(None);
+    };
+    let path = picked
+        .into_path()
+        .map_err(|e| format!("Could not use that file: {e}"))?;
+    state.inner().remember_picked_file(path.clone()).await;
+    Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+/// Extensions offered by the attachment picker; must stay in sync with the
+/// UI's `IMAGE_EXTS`/`VIDEO_EXTS` and with what the upload path accepts
+/// (JPEG/PNG/WEBP images, MP4-family video).
+const MEDIA_EXTS: [&str; 8] = ["jpg", "jpeg", "png", "webp", "mp4", "mov", "mkv", "webm"];
+
 /// Send an image pasted into the composer (clipboard bytes, no filesystem path).
 #[tauri::command]
 pub fn send_photo_bytes(
@@ -271,6 +322,13 @@ pub async fn fetch_image(
     state: State<'_, SharedService>,
     url: String,
 ) -> Result<Option<String>, String> {
+    // The URL comes from message payloads rendered by the webview. Restricting
+    // it to Instagram-owned hosts keeps this from acting as a general
+    // fetch-anything proxy (and `public_get` only attaches the sessionid
+    // cookie to those hosts anyway).
+    if !instagrapi::client::is_instagram_host(&url) {
+        return Err(format!("refusing to fetch non-Instagram url: {url}"));
+    }
     let svc = state.inner();
     match svc.client.public_get(&url).await {
         Ok((_status, headers, bytes)) => {

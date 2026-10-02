@@ -39,6 +39,21 @@ struct Transport {
     write: Mutex<WriteHalf>,
 }
 
+/// Monotonic MQTT packet identifier in `1..=u16::MAX` (0 is invalid).
+fn next_packet_id(counter: &std::sync::atomic::AtomicU16) -> u16 {
+    use std::sync::atomic::Ordering;
+    loop {
+        let current = counter.load(Ordering::Relaxed);
+        let next = if current == u16::MAX { 1 } else { current + 1 };
+        if counter
+            .compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return next;
+        }
+    }
+}
+
 impl Transport {
     async fn connect(host: &str, port: u16) -> Result<Self> {
         let addr = format!("{host}:{port}");
@@ -159,8 +174,11 @@ fn tls_config() -> &'static Arc<rustls::ClientConfig> {
     })
 }
 
-/// Realtime client: owns the transport + handlers. All socket writes go
-/// through one mutex so the reader task and UI publishes serialize.
+/// Realtime client: owns the transport + handlers. The socket halves carry
+/// their own mutexes, so the outer slot only guards the `Arc` and is released
+/// before any I/O: the reader task blocks up to 30s inside `recv_packet`, and
+/// holding the slot across it would stall every outbound publish (typing
+/// indicators, read receipts) and the keepalive ping behind it.
 pub struct RealtimeClient {
     client: Client,
     transport: Mutex<Option<Arc<Transport>>>,
@@ -200,11 +218,17 @@ impl RealtimeClient {
     }
 
     fn emit(&self, event: &str, payload: Value) {
-        let handlers = self.handlers.lock().expect("handlers mutex");
-        let Some(list) = handlers.get(event) else {
-            return;
+        // Snapshot the handler list and release the lock before dispatching:
+        // handlers run on the reader task, and a handler that calls `on()`
+        // (or any other task calling it) would deadlock on this non-reentrant
+        // mutex while the dispatch is in flight.
+        let snapshot: Vec<Handler> = {
+            let handlers = self.handlers.lock().expect("handlers mutex");
+            match handlers.get(event) {
+                Some(list) => list.clone(),
+                None => return,
+            }
         };
-        let snapshot: Vec<Handler> = list.clone();
         for handler in snapshot {
             handler(payload.clone());
         }
@@ -403,10 +427,7 @@ impl RealtimeClient {
     }
 
     async fn publish_bytes(&self, topic: &str, payload: &[u8]) -> Result<()> {
-        let id = self
-            .packet_id
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            + 1;
+        let id = next_packet_id(&self.packet_id);
         let packet = write_publish_packet(topic, payload, 1, id);
         // Clone the transport out so an in-flight read (which may idle for up
         // to its 30s timeout) never delays a publish; socket writes serialize
@@ -428,11 +449,9 @@ impl RealtimeClient {
                 "Realtime client is not connected",
             ));
         }
-        {
-            let transport = self.transport.lock().await.clone();
-            if let Some(t) = transport {
-                t.send(&write_pingreq_packet()).await?;
-            }
+        let transport = self.transport.lock().await.clone();
+        if let Some(t) = transport {
+            t.send(&write_pingreq_packet()).await?;
         }
         for _ in 0..5 {
             let packet = self.read_once().await?;
@@ -480,7 +499,7 @@ impl RealtimeClient {
             .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(body.as_ref()).into_owned()));
         // Verbose diagnostics: surface every inbound payload so unknown
         // event shapes (e.g. reactions from other devices) are visible.
-        eprintln!(
+        log::debug!(
             "[igdm-mqtt] recv topic={topic} payload={}",
             crate::utils::json_preview(&parsed, 600)
         );
@@ -546,7 +565,7 @@ impl RealtimeClient {
                     continue;
                 }
                 let op = patch_obj.get("op").cloned().unwrap_or(Value::Null);
-                eprintln!(
+                log::debug!(
                     "[igdm-mqtt] iris patch path={path} op={} value={}",
                     serde_json::to_string(&op).unwrap_or_default(),
                     crate::utils::json_preview(&value, 600)
@@ -659,13 +678,13 @@ impl RealtimeClient {
             }
         }
         self.emit("direct", event.clone());
-        eprintln!(
+        log::debug!(
             "[igdm-mqtt] direct event: {}",
             crate::utils::json_preview(&event, 600)
         );
         match direct_realtime_event_kind(&event) {
             Some(kind) => self.emit(kind, event),
-            None => eprintln!(
+            None => log::debug!(
                 "[instagrapi] unhandled realtime event: {}",
                 crate::utils::dumps(&event)
             ),

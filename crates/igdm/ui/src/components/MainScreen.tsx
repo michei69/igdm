@@ -8,6 +8,7 @@ import "yet-another-react-lightbox/styles.css";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useApp } from "../hooks/useApp";
 import { useReplyHunt } from "../hooks/useReplyHunt";
+import { useAppIsDark } from "../hooks/useAppIsDark";
 import Sidebar from "./sidebar/Sidebar";
 import ChatHeader from "./chat/ChatHeader";
 import ApproveBar from "./chat/ApproveBar";
@@ -16,7 +17,7 @@ import Composer from "./chat/Composer";
 import ShareModal from "./chat/ShareModal";
 import { useRemoteImage } from "../hooks/useRemoteImage";
 import type { MediaPreview, ShareAttachment } from "../lib/attachment";
-import { appIsDark, pickThreadTheme, themeBackgroundUrl, threadThemeVars } from "../lib/chatTheme";
+import { pickThreadTheme, themeBackgroundUrl, threadThemeVars } from "../lib/chatTheme";
 
 export default function MainScreen() {
   const { state, setReplyScroll, setReply, downloadMedia } = useApp();
@@ -36,17 +37,21 @@ export default function MainScreen() {
   };
 
   // Per-thread IG theme: pick the variant matching the app's color mode and
-  // expose it to the message pane via CSS variables.
+  // expose it to the message pane via CSS variables. The mode is subscribed
+  // state: it changes without any React state update when the Settings window
+  // broadcasts a theme, so a memo keyed on the thread data alone kept the
+  // previous variant's colors until another chat was opened.
   const ts = openKey ? state.threads[openKey] : undefined;
+  const isDark = useAppIsDark();
   const themeData = useMemo(() => {
     if (!state.chatThemesEnabled || !ts?.theme_data) return null;
-    const chatTheme = pickThreadTheme(ts.theme_data, appIsDark());
+    const chatTheme = pickThreadTheme(ts.theme_data, isDark);
     if (!chatTheme) return null;
     return {
       vars: threadThemeVars(chatTheme),
       bgUrl: themeBackgroundUrl(chatTheme),
     };
-  }, [ts?.theme_data, state.chatThemesEnabled]);
+  }, [ts?.theme_data, state.chatThemesEnabled, isDark]);
   const themeVars = themeData?.vars ?? undefined;
   const themeBgUrl = themeData?.bgUrl ?? null;
 

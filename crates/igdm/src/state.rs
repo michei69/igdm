@@ -65,6 +65,10 @@ pub enum AppEvent {
         msg: DirectMessage,
     },
     SendFailed(String, String),
+    /// A history fetch failed (page of messages, older page, thread details).
+    /// Kept separate from `SendFailed` so the UI does not delete the optimistic
+    /// echo of a message that was never sent.
+    LoadFailed(String, String),
     SearchResults(String, Vec<UserShort>),
     SearchFailed(String),
     ThreadByUser(UserShort, Option<String>),
@@ -90,6 +94,7 @@ impl AppEvent {
             AppEvent::OlderLoaded(..) => "OlderLoaded",
             AppEvent::Sent { .. } => "Sent",
             AppEvent::SendFailed(..) => "SendFailed",
+            AppEvent::LoadFailed(..) => "LoadFailed",
             AppEvent::SearchResults(..) => "SearchResults",
             AppEvent::SearchFailed(..) => "SearchFailed",
             AppEvent::ThreadByUser(..) => "ThreadByUser",
@@ -146,6 +151,7 @@ impl serde::Serialize for AppEvent {
                 },
             )?,
             AppEvent::SendFailed(a, b) => s.serialize_entry("data", &(a, b))?,
+            AppEvent::LoadFailed(a, b) => s.serialize_entry("data", &(a, b))?,
             AppEvent::SearchResults(a, b) => s.serialize_entry("data", &(a, b))?,
             AppEvent::SearchFailed(q) => s.serialize_entry("data", &(q,))?,
             AppEvent::ThreadByUser(user, tid) => s.serialize_entry("data", &(user, tid))?,

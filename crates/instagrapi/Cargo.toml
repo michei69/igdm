@@ -24,6 +24,7 @@ flate2 = { workspace = true }
 image = { workspace = true }
 percent-encoding = { workspace = true }
 futures-util = { workspace = true }
+bytes = "1"
 rsa = { version = "0.9", features = ["sha2"] }
 aes-gcm = "0.10"
 tokio-rustls = "0.26"

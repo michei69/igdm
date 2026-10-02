@@ -1,0 +1,310 @@
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: linux ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bundles: deb,rpm,appimage
+            artifact: igdm-linux-x64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            bundles: deb,rpm,appimage
+            artifact: igdm-linux-arm64
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            rpm
+
+      - uses: oven-sh/setup-bun@v2
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+
+      - name: Install package dependencies
+        run: |
+          bun install --frozen-lockfile
+          bun install --frozen-lockfile --cwd crates/igdm/ui
+
+      - name: Build
+        working-directory: crates/igdm
+        env:
+          # build.rs would otherwise shell out to bun; the Tauri hook above
+          # (beforeBuildCommand = "bun run build") already built ui/dist.
+          IGDM_SKIP_FRONTEND: "1"
+          # linuxdeploy bundles an old binutils whose `strip` cannot read the
+          # `.relr.dyn` section modern linkers emit; it treats that failure as
+          # fatal and the AppImage step aborts. The system libraries it would
+          # strip are already stripped by the distro.
+          NO_STRIP: "1"
+        run: bunx tauri build --bundles ${{ matrix.bundles }} --target ${{ matrix.target }} --ci
+
+      - name: Stage installers
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find "target/${{ matrix.target }}/release/bundle" -type f \
+            \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' \
+               -o -name '*.exe' -o -name '*.dmg' \) \
+            -exec cp -v {} dist/ \;
+          for f in dist/*; do
+            [ -e "$f" ] || continue
+            mv -v "$f" "$(echo "$f" | tr ' ' '-')"
+          done
+          test -n "$(ls -A dist)"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+          if-no-files-found: error
+
+  windows:
+    name: windows ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+            artifact: igdm-windows-x64
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            bundles: nsis
+            artifact: igdm-windows-arm64
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+
+      - name: Install package dependencies
+        run: |
+          bun install --frozen-lockfile
+          bun install --frozen-lockfile --cwd crates/igdm/ui
+
+      - name: Build
+        working-directory: crates/igdm
+        env:
+          # build.rs would otherwise shell out to bun; the Tauri hook above
+          # (beforeBuildCommand = "bun run build") already built ui/dist.
+          IGDM_SKIP_FRONTEND: "1"
+        run: bunx tauri build --bundles ${{ matrix.bundles }} --target ${{ matrix.target }} --ci
+
+      - name: Stage installers
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find "target/${{ matrix.target }}/release/bundle" -type f \
+            \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' \
+               -o -name '*.exe' -o -name '*.dmg' \) \
+            -exec cp -v {} dist/ \;
+          for f in dist/*; do
+            [ -e "$f" ] || continue
+            mv -v "$f" "$(echo "$f" | tr ' ' '-')"
+          done
+          test -n "$(ls -A dist)"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+          if-no-files-found: error
+
+  macos:
+    name: macos ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    # No Apple certificate in this repo: ad-hoc sign the .app and the .dmg.
+    env:
+      APPLE_SIGNING_IDENTITY: "-"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            bundles: app,dmg
+            artifact: igdm-macos-arm64
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .
+
+      - name: Install package dependencies
+        run: |
+          bun install --frozen-lockfile
+          bun install --frozen-lockfile --cwd crates/igdm/ui
+
+      - name: Build
+        working-directory: crates/igdm
+        env:
+          # build.rs would otherwise shell out to bun; the Tauri hook above
+          # (beforeBuildCommand = "bun run build") already built ui/dist.
+          IGDM_SKIP_FRONTEND: "1"
+        run: bunx tauri build --bundles ${{ matrix.bundles }} --target ${{ matrix.target }} --ci
+
+      - name: Stage installers
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find "target/${{ matrix.target }}/release/bundle" -type f \
+            \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' \
+               -o -name '*.exe' -o -name '*.dmg' \) \
+            -exec cp -v {} dist/ \;
+          find "target/${{ matrix.target }}/release/bundle" -maxdepth 3 -type d \
+            -name '*.app' -exec cp -Rv {} dist/ \;
+          for f in dist/*; do
+            [ -e "$f" ] || continue
+            mv -v "$f" "$(echo "$f" | tr ' ' '-')"
+          done
+          test -n "$(ls -A dist)"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+          if-no-files-found: error
+
+  flatpak:
+    name: flatpak ${{ matrix.artifact }}
+    needs: linux
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
+      options: --privileged
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            deb: igdm-linux-x64
+            artifact: igdm-flatpak-x64
+          - runner: ubuntu-24.04-arm
+            deb: igdm-linux-arm64
+            artifact: igdm-flatpak-arm64
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ matrix.deb }}
+          path: debs
+
+      - name: Stage deb contents
+        run: |
+          mkdir -p flatpak/stage
+          if command -v dpkg-deb > /dev/null 2>&1; then
+            dpkg-deb -x debs/*.deb flatpak/stage
+          else
+            # ghcr.io/flathub-infra/flatpak-github-actions is a Freedesktop-SDK
+            # image without dpkg; a .deb is an `ar` archive holding data.tar.gz.
+            work=$(mktemp -d)
+            cp debs/*.deb "$work/pkg.deb"
+            (cd "$work" && ar x pkg.deb)
+            tar -xf "$work"/data.tar.* -C flatpak/stage
+          fi
+
+      - name: Ensure GNOME runtime and SDK
+        run: |
+          flatpak remote-add --if-not-exists --user flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          for ref in org.gnome.Platform//50 org.gnome.Sdk//50; do
+            if ! flatpak info "$ref" > /dev/null 2>&1; then
+              flatpak install --user --noninteractive flathub "$ref"
+            fi
+          done
+
+      - name: Build flatpak
+        run: |
+          mkdir -p dist
+          flatpak-builder --user --force-clean --disable-rofiles-fuse \
+            --repo=flatpak/repo flatpak/build-dir flatpak/dev.igdm.client.yml
+          flatpak build-bundle flatpak/repo dist/igdm.flatpak dev.igdm.client stable
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/igdm.flatpak
+          if-no-files-found: error
+
+  release:
+    name: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, windows, macos, flatpak]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    permissions:
+      # needed by actions/download-artifact when the token is restricted
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --title "$GITHUB_REF_NAME"
