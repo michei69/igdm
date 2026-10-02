@@ -23,5 +23,13 @@ flatpak/build-dir/
 flatpak/repo/
 flatpak/.flatpak-builder/
 
-# Local bundle output (scripts/build-flatpak.sh)
+# Snap (snapcraft.yaml + snap/gui are committed; staging + build output are generated)
+snap/stage/
+*.snap
+# snapcraft --destructive-mode builds these in the project directory
+/parts/
+/stage/
+/prime/
+
+# Local bundle output (scripts/package-linux.sh, build-flatpak.sh, build-snap.sh)
 dist/

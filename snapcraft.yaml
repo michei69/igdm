@@ -1,0 +1,95 @@
+# Snap manifest for IG Direct.
+#
+# Like the flatpak, this packages an already-built binary: CI extracts the .deb
+# produced by the `linux` job of .github/workflows/build.yml into `snap/stage/`
+# and only the packaging happens here, so the snap step needs no crates.io or
+# npm access and ships byte-identical code to the deb.
+#
+# This file sits at the repo root because snapcraft resolves part `source`
+# paths relative to the directory it is run in, not relative to the manifest.
+# The GUI assets keep the conventional `snap/gui/` location.
+#
+#   scripts/build-snap.sh [target-triple]
+#
+# which is equivalent to:
+#
+#   dpkg-deb -x target/release/bundle/deb/*.deb snap/stage
+#   snapcraft --destructive-mode
+#
+# `version` is rewritten from the workspace Cargo.toml by the workflow (and by
+# scripts/build-snap.sh locally); the literal below is only a fallback.
+name: igdm
+# core22 is what the Tauri/WebKitGTK snap recipe is built around (the gnome
+# extension plus stage-packaged libwebkit2gtk-4.1-0). It also means
+# `snapcraft --destructive-mode` needs an Ubuntu 22.04 host, which is why the
+# CI job uses ubuntu-22.04 / ubuntu-22.04-arm rather than the newer images.
+base: core22
+version: '0.1.0'
+summary: Instagram DM desktop client
+description: |
+  IG Direct is a desktop client for Instagram Direct messages, built with
+  Tauri 2 and React.
+
+  It talks to Instagram's private mobile API directly, so it needs neither the
+  web app nor a browser: sign in with a username and password (two-factor and
+  SMS/email challenges included) or a session cookie, then browse your inbox
+  with search, live typing indicators, read receipts, reactions and media
+  previews.
+
+  Messages are delivered over a persistent MQTToT connection with automatic
+  reconnects, and you can send text, photos, videos and voice messages.
+
+grade: stable
+confinement: strict
+icon: snap/gui/igdm.png
+license: MIT
+website: https://github.com/michei69/igdm
+source-code: https://github.com/michei69/igdm
+issues: https://github.com/michei69/igdm/issues
+
+# WebKitGTK looks for its web process helpers under the system prefix; inside
+# the snap they live under $SNAP, so bind that path back. Required by every
+# Tauri/WebKitGTK snap (see the Tauri snapcraft guide).
+layout:
+  /usr/lib/$SNAPCRAFT_ARCH_TRIPLET/webkit2gtk-4.1:
+    bind: $SNAP/usr/lib/$SNAPCRAFT_ARCH_TRIPLET/webkit2gtk-4.1
+
+apps:
+  igdm:
+    command: usr/bin/igdm
+    desktop: usr/share/applications/dev.igdm.client.desktop
+    # The gnome extension already provides desktop, desktop-legacy, gsettings,
+    # opengl, wayland, x11 and mount-observe.
+    extensions: [gnome]
+    plugs:
+      - network
+      - network-bind
+      - audio-playback
+      - audio-record
+      # The attachment picker is a GTK dialog, so the user's own files have to
+      # be reachable (photos/videos live in ~/Pictures and ~/Videos).
+      - home
+      - browser-support
+    # `home` does not cover hidden paths, so ~/.igdm is out of reach under
+    # strict confinement. Point the app at its own per-user data directory
+    # instead; `sessions_dir()` in crates/igdm/src/lib.rs honours this and
+    # derives settings.json from its parent.
+    environment:
+      IGDM_SESSIONS: $SNAP_USER_COMMON/sessions
+
+parts:
+  igdm:
+    plugin: dump
+    source: snap/stage
+    source-type: local
+    stage-packages:
+      - libwebkit2gtk-4.1-0
+      - libayatana-appindicator3-1
+      # Voice messages are transcoded by shelling out to ffmpeg (see
+      # `transcode_to_m4a` in crates/igdm/src/service.rs); the host's ffmpeg is
+      # invisible inside a strict snap, so it ships with the app.
+      - ffmpeg
+    # Tauri names the desktop entry after `productName` ("IG Direct.desktop"),
+    # but the appstream metainfo it ships declares `dev.igdm.client.desktop`.
+    organize:
+      usr/share/applications/IG Direct.desktop: usr/share/applications/dev.igdm.client.desktop

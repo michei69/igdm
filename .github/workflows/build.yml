@@ -1,42 +1,47 @@
 name: build
 
+# Reusable build: `release.yml` calls it on a tag push, and it also runs on its
+# own for pushes to main, pull requests and manual dispatches.
 on:
+  workflow_call:
   workflow_dispatch:
   push:
     branches: [main]
-    tags: ['v*']
+  pull_request:
 
 permissions:
   contents: read
 
 concurrency:
-  group: build-${{ github.ref }}
+  group: build-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  # deb + rpm + AppImage from tauri, then scripts/package-linux.sh normalises
+  # them and adds the portable tarball and the AppDir tarball.
   linux:
-    name: linux ${{ matrix.target }}
+    name: linux ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         include:
+          # 22.04 is the oldest runner with webkit2gtk-4.1, which keeps the
+          # AppImage's glibc floor as low as it can be.
           - runner: ubuntu-22.04
+            arch: x86_64
             target: x86_64-unknown-linux-gnu
-            bundles: deb,rpm,appimage
-            artifact: igdm-linux-x64
           - runner: ubuntu-24.04-arm
+            arch: aarch64
             target: aarch64-unknown-linux-gnu
-            bundles: deb,rpm,appimage
-            artifact: igdm-linux-arm64
     steps:
       - uses: actions/checkout@v7
 
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
+          sudo apt-get install -y --no-install-recommends \
             libwebkit2gtk-4.1-dev \
             build-essential \
             curl \
@@ -63,10 +68,10 @@ jobs:
           bun install --frozen-lockfile
           bun install --frozen-lockfile --cwd crates/igdm/ui
 
-      - name: Build
+      - name: Build bundles
         working-directory: crates/igdm
         env:
-          # build.rs would otherwise shell out to bun; the Tauri hook above
+          # build.rs would otherwise shell out to bun; the Tauri hook
           # (beforeBuildCommand = "bun run build") already built ui/dist.
           IGDM_SKIP_FRONTEND: "1"
           # linuxdeploy bundles an old binutils whose `strip` cannot read the
@@ -74,45 +79,34 @@ jobs:
           # fatal and the AppImage step aborts. The system libraries it would
           # strip are already stripped by the distro.
           NO_STRIP: "1"
-        run: bunx tauri build --bundles ${{ matrix.bundles }} --target ${{ matrix.target }} --ci
+        run: bunx tauri build --bundles deb,rpm,appimage --target ${{ matrix.target }} --ci
 
-      - name: Stage installers
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          find "target/${{ matrix.target }}/release/bundle" -type f \
-            \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' \
-               -o -name '*.exe' -o -name '*.dmg' \) \
-            -exec cp -v {} dist/ \;
-          for f in dist/*; do
-            [ -e "$f" ] || continue
-            mv -v "$f" "$(echo "$f" | tr ' ' '-')"
-          done
-          test -n "$(ls -A dist)"
+      - name: Package artifacts
+        run: scripts/package-linux.sh ${{ matrix.target }}
 
       - uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.artifact }}
+          name: igdm-linux-${{ matrix.arch }}
           path: dist/*
           if-no-files-found: error
 
+  # NSIS is the one Windows installer this project ships: it is per-user
+  # (bundle.windows.nsis.installMode = currentUser), so it needs no admin
+  # rights and works on every supported Windows.
   windows:
-    name: windows ${{ matrix.target }}
+    name: windows ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         include:
           - runner: windows-2022
+            arch: x86_64
             target: x86_64-pc-windows-msvc
-            bundles: nsis
-            artifact: igdm-windows-x64
           - runner: windows-11-arm
+            arch: arm64
             target: aarch64-pc-windows-msvc
-            bundles: nsis
-            artifact: igdm-windows-arm64
     steps:
       - uses: actions/checkout@v7
 
@@ -131,50 +125,33 @@ jobs:
           bun install --frozen-lockfile
           bun install --frozen-lockfile --cwd crates/igdm/ui
 
-      - name: Build
+      - name: Build bundles
         working-directory: crates/igdm
         env:
-          # build.rs would otherwise shell out to bun; the Tauri hook above
-          # (beforeBuildCommand = "bun run build") already built ui/dist.
           IGDM_SKIP_FRONTEND: "1"
-        run: bunx tauri build --bundles ${{ matrix.bundles }} --target ${{ matrix.target }} --ci
+        run: bunx tauri build --bundles nsis --target ${{ matrix.target }} --ci
 
       - name: Stage installers
         shell: bash
         run: |
           set -euo pipefail
+          version=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)
           mkdir -p dist
-          find "target/${{ matrix.target }}/release/bundle" -type f \
-            \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' \
-               -o -name '*.exe' -o -name '*.dmg' \) \
-            -exec cp -v {} dist/ \;
-          for f in dist/*; do
-            [ -e "$f" ] || continue
-            mv -v "$f" "$(echo "$f" | tr ' ' '-')"
-          done
+          find "target/${{ matrix.target }}/release/bundle/nsis" -name '*-setup.exe' \
+            -exec cp {} "dist/igdm-$version-windows-${{ matrix.arch }}-setup.exe" \;
           test -n "$(ls -A dist)"
 
       - uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.artifact }}
+          name: igdm-windows-${{ matrix.arch }}
           path: dist/*
           if-no-files-found: error
 
+  # One universal .dmg (Intel + Apple Silicon) plus the .app itself.
   macos:
-    name: macos ${{ matrix.target }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
-    # No Apple certificate in this repo: ad-hoc sign the .app and the .dmg.
-    env:
-      APPLE_SIGNING_IDENTITY: "-"
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-latest
-            target: aarch64-apple-darwin
-            bundles: app,dmg
-            artifact: igdm-macos-arm64
+    name: macos universal
+    runs-on: macos-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
 
@@ -182,7 +159,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -193,39 +170,56 @@ jobs:
           bun install --frozen-lockfile
           bun install --frozen-lockfile --cwd crates/igdm/ui
 
-      - name: Build
+      # Tauri treats an empty APPLE_CERTIFICATE as a real (invalid) value, and
+      # forks/PRs have no secrets, so only export the ones that are set. With
+      # none set the app is ad-hoc signed and Gatekeeper needs a right-click →
+      # Open the first time.
+      - name: Configure signing
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          echo "APPLE_SIGNING_IDENTITY=${APPLE_SIGNING_IDENTITY:--}" >> "$GITHUB_ENV"
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            value="${!name}"
+            if [ -n "$value" ]; then
+              echo "$name=$value" >> "$GITHUB_ENV"
+            fi
+          done
+
+      - name: Build bundles
         working-directory: crates/igdm
         env:
-          # build.rs would otherwise shell out to bun; the Tauri hook above
-          # (beforeBuildCommand = "bun run build") already built ui/dist.
           IGDM_SKIP_FRONTEND: "1"
-        run: bunx tauri build --bundles ${{ matrix.bundles }} --target ${{ matrix.target }} --ci
+        run: bunx tauri build --bundles app,dmg --target universal-apple-darwin --ci
 
       - name: Stage installers
         shell: bash
         run: |
           set -euo pipefail
+          version=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)
+          bundle="target/universal-apple-darwin/release/bundle"
           mkdir -p dist
-          find "target/${{ matrix.target }}/release/bundle" -type f \
-            \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' \
-               -o -name '*.exe' -o -name '*.dmg' \) \
-            -exec cp -v {} dist/ \;
-          find "target/${{ matrix.target }}/release/bundle" -maxdepth 3 -type d \
-            -name '*.app' -exec cp -Rv {} dist/ \;
-          for f in dist/*; do
-            [ -e "$f" ] || continue
-            mv -v "$f" "$(echo "$f" | tr ' ' '-')"
-          done
+          find "$bundle/dmg" -name '*.dmg' -exec cp {} "dist/igdm-$version-macos-universal.dmg" \;
+          tar -czf "dist/igdm-$version-macos-universal.app.tar.gz" -C "$bundle/macos" "IG Direct.app"
           test -n "$(ls -A dist)"
 
       - uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.artifact }}
+          name: igdm-macos-universal
           path: dist/*
           if-no-files-found: error
 
+  # Flatpak and snap both repackage the linux job's portable tarball, so neither
+  # needs crates.io/npm access and both ship the same binary as the .deb.
   flatpak:
-    name: flatpak ${{ matrix.artifact }}
+    name: flatpak ${{ matrix.arch }}
     needs: linux
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
@@ -237,35 +231,41 @@ jobs:
       matrix:
         include:
           - runner: ubuntu-22.04
-            deb: igdm-linux-x64
-            artifact: igdm-flatpak-x64
+            arch: x86_64
+            artifact: igdm-linux-x86_64
           - runner: ubuntu-24.04-arm
-            deb: igdm-linux-arm64
-            artifact: igdm-flatpak-arm64
+            arch: aarch64
+            artifact: igdm-linux-aarch64
     steps:
       - uses: actions/checkout@v7
 
       - uses: actions/download-artifact@v8
         with:
-          name: ${{ matrix.deb }}
-          path: debs
+          name: ${{ matrix.artifact }}
+          path: artifacts
 
-      - name: Stage deb contents
+      - name: Stage the portable tarball
         run: |
-          mkdir -p flatpak/stage
-          if command -v dpkg-deb > /dev/null 2>&1; then
-            dpkg-deb -x debs/*.deb flatpak/stage
-          else
-            # ghcr.io/flathub-infra/flatpak-github-actions is a Freedesktop-SDK
-            # image without dpkg; a .deb is an `ar` archive holding data.tar.gz.
-            work=$(mktemp -d)
-            cp debs/*.deb "$work/pkg.deb"
-            (cd "$work" && ar x pkg.deb)
-            tar -xf "$work"/data.tar.* -C flatpak/stage
+          set -euo pipefail
+          tarball=""
+          for f in artifacts/*.tar.gz; do
+            case "$f" in
+              *.AppDir.tar.gz) continue ;;
+            esac
+            tarball="$f"
+            break
+          done
+          if [ -z "$tarball" ]; then
+            echo "no portable tarball in artifacts/" >&2
+            exit 1
           fi
+          echo "using $tarball"
+          mkdir -p flatpak/stage
+          tar -xzf "$tarball" --strip-components=1 -C flatpak/stage
 
-      - name: Ensure GNOME runtime and SDK
+      - name: Ensure the GNOME runtime and SDK
         run: |
+          set -euo pipefail
           flatpak remote-add --if-not-exists --user flathub https://dl.flathub.org/repo/flathub.flatpakrepo
           for ref in org.gnome.Platform//50 org.gnome.Sdk//50; do
             if ! flatpak info "$ref" > /dev/null 2>&1; then
@@ -275,36 +275,69 @@ jobs:
 
       - name: Build flatpak
         run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)
           mkdir -p dist
           flatpak-builder --user --force-clean --disable-rofiles-fuse \
             --repo=flatpak/repo flatpak/build-dir flatpak/dev.igdm.client.yml
-          flatpak build-bundle flatpak/repo dist/igdm.flatpak dev.igdm.client stable
+          flatpak build-bundle flatpak/repo "dist/igdm-$version-linux-${{ matrix.arch }}.flatpak" \
+            dev.igdm.client stable
 
       - uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.artifact }}
-          path: dist/igdm.flatpak
+          name: igdm-flatpak-${{ matrix.arch }}
+          path: dist/*
           if-no-files-found: error
 
-  release:
-    name: release
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [linux, windows, macos, flatpak]
-    runs-on: ubuntu-22.04
+  snap:
+    name: snap ${{ matrix.arch }}
+    needs: linux
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
-    permissions:
-      # needed by actions/download-artifact when the token is restricted
-      actions: read
-      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 22.04 matches the core22 base, which `snapcraft --destructive-mode`
+          # requires of its host.
+          - runner: ubuntu-22.04
+            arch: x86_64
+            artifact: igdm-linux-x86_64
+          - runner: ubuntu-22.04-arm
+            arch: aarch64
+            artifact: igdm-linux-aarch64
     steps:
       - uses: actions/checkout@v7
 
       - uses: actions/download-artifact@v8
         with:
-          path: dist
-          merge-multiple: true
+          name: ${{ matrix.artifact }}
+          path: artifacts
 
-      - name: Create release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --generate-notes --title "$GITHUB_REF_NAME"
+      - name: Stage the deb
+        run: |
+          set -euo pipefail
+          mkdir -p snap/stage
+          dpkg-deb -x artifacts/*.deb snap/stage
+
+      - name: Set the snap version from the workspace
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)
+          sed -i "s/^version: .*/version: '$version'/" snapcraft.yaml
+
+      - uses: snapcore/action-build@v1
+        id: snapcraft
+
+      - name: Stage the snap
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)
+          mkdir -p dist
+          cp "${{ steps.snapcraft.outputs.snap }}" "dist/igdm-$version-linux-${{ matrix.arch }}.snap"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: igdm-snap-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error

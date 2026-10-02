@@ -31,29 +31,50 @@ bun install                    # root deps: tauri CLI
 bun run frontend:install       # frontend deps (bun install --cwd crates/igdm/ui)
 bun run dev                    # dev: Vite HMR + hot rust reload
 bun run build                  # release -> target/release/bundle/<all host bundles>
-bun run build:linux            # deb + rpm + appimage
-bun run build:flatpak          # flatpak (needs flatpak-builder; stages the deb, see flatpak/)
+bun run build:linux            # deb + rpm + appimage -> dist/ (adds the tarballs)
+bun run build:flatpak          # flatpak (needs flatpak-builder)
+bun run build:snap             # snap (needs snapcraft)
 bun run run                    # cargo run -p igdm (embeds built frontend)
 ```
 
-`cargo run -p igdm` works straight from the root too — `crates/igdm/build.rs` builds the frontend automatically when `ui/dist` is missing (bypass with `IGDM_SKIP_FRONTEND=1`, e.g. headless CI). but `cargo run` embeds whatever's in `ui/dist` - use `bun run dev` for live frontend changes. sessions live in `~/.igdm/sessions/` (override with `IGDM_SESSIONS`)
+`cargo run -p igdm` works straight from the root too — `crates/igdm/build.rs` builds the frontend automatically when `ui/dist` is missing (bypass with `IGDM_SKIP_FRONTEND=1`, e.g. headless CI). but `cargo run` embeds whatever's in `ui/dist` - use `bun run dev` for live frontend changes. sessions live in `~/.igdm/sessions/` (override with `IGDM_SESSIONS`; the snap sets this to its own `$SNAP_USER_COMMON` because `home` does not cover dotfiles under strict confinement)
 
 ## builds
 
-`.github/workflows/build.yml` builds every supported desktop target on a tag push (`v*`), a push to `main`, or manually, and attaches the installers to a GitHub Release on tags:
+`scripts/package-linux.sh` is the one entry point for linux: it runs after `tauri build` and normalises everything into `dist/` under a single `igdm-<version>-linux-<arch>.<ext>` naming scheme. tauri itself only knows `deb`, `rpm` and `appimage`, so the rest is assembled here.
 
-| target | artifact |
+| installer | how | notes |
+| --- | --- | --- |
+| `.AppImage` | tauri (`linuxdeploy`) | one file, no install, bundles webkit; needs FUSE (or `--appimage-extract-and-run`) |
+| `.AppDir.tar.gz` | this repo | the AppImage's AppDir, for machines without FUSE |
+| `.deb` | tauri | debian/ubuntu/mint/pop; `Depends: libwebkit2gtk-4.1-0, libgtk-3-0` |
+| `.rpm` | tauri | fedora/rhel/opensuse; needs `rpmbuild` |
+| `.tar.gz` | this repo | portable prefix (`bin/`, `share/`): run in place or unpack into `~/.local`; no root, no package manager |
+| `.snap` | `snap/snapcraft.yaml` | ubuntu (and any distro with snapd); strict confinement, bundles webkit + ffmpeg |
+| `.flatpak` | `flatpak/dev.igdm.client.yml` | distro-agnostic sandbox; bundles the GNOME runtime |
+
+the portable tarball is the `.deb`'s file tree with `usr/` stripped (`bin/igdm` + `share/`), and it is what the flatpak consumes; the snap consumes the `.deb` directly. all three therefore ship the exact same binary and none of them need network access to crates.io or npm.
+
+note the `.AppDir.tar.gz` is ~126 MB: it is the fully self-contained bundle (webkit and friends included), the same content the AppImage wraps. skip it with `IGDM_SKIP_APPDIR=1` if you only want the AppImage.
+
+for the other desktops:
+
+| target | installer |
 | --- | --- |
-| linux x86_64 | `.deb`, `.rpm`, `.AppImage` |
-| linux aarch64 | `.deb`, `.rpm`, `.AppImage` |
-| windows x86_64 | NSIS `.exe` |
-| windows aarch64 | NSIS `.exe` |
-| macOS aarch64 | `.app`, `.dmg` |
-| flatpak x86_64 / aarch64 | `igdm.flatpak` |
+| windows x86_64 / arm64 | NSIS `.exe` (per-user, no admin) |
+| macOS universal | `.dmg` + `.app.tar.gz` (one bundle for intel + apple silicon) |
 
-macOS builds are ad-hoc signed (`APPLE_SIGNING_IDENTITY: "-"`) because the repo has no Apple certificate, so Gatekeeper needs a right-click → Open (or `xattr -dr com.apple.quarantine`) the first time. set `APPLE_CERTIFICATE`/`APPLE_CERTIFICATE_PASSWORD`/`APPLE_SIGNING_IDENTITY` (and `APPLE_ID`/`APPLE_PASSWORD`/`APPLE_TEAM_ID` for notarization) as repo secrets to get a signed, notarized build instead.
+## ci
 
-the flatpak job reuses the linux `.deb` (extracted with `dpkg-deb`), so `flatpak/dev.igdm.client.yml` never needs network access to crates.io/npm.
+`.github/workflows/build.yml` is the reusable build: it runs on pushes to `main`, pull requests and manual dispatches, and builds every installer above on native runners (linux x64 + arm64, windows x64 + arm64, macOS universal). `.github/workflows/release.yml` calls it on a `v*` tag, verifies the tag matches the workspace version, writes `SHA256SUMS`, and attaches everything to a GitHub Release:
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+nothing is uploaded to the snap store or to Flathub; both are separate, opt-in steps (`snapcraft upload`, or a Flathub repo pointing at `flatpak/dev.igdm.client.yml`).
+
+macOS builds are ad-hoc signed (`APPLE_SIGNING_IDENTITY: "-"`) because the repo has no Apple certificate, so Gatekeeper needs a right-click → Open (or `xattr -dr com.apple.quarantine`) the first time. set `APPLE_CERTIFICATE`/`APPLE_CERTIFICATE_PASSWORD`/`APPLE_SIGNING_IDENTITY` (and `APPLE_ID`/`APPLE_PASSWORD`/`APPLE_TEAM_ID` for notarization) as repo secrets to get a signed, notarized build instead; the workflow only exports the ones that are actually set, so forks and PRs still build.
 
 ## architecture
 
@@ -61,8 +82,11 @@ the flatpak job reuses the linux `.deb` (extracted with `dpkg-deb`), so `flatpak
 - `crates/igdm/src/` - tauri backend
 - `crates/igdm/tauri.conf.json` — window config, bundle, webview UA
 - `crates/igdm/ui/` — react frontend
-- `flatpak/` - flatpak manifest + appstream metainfo (packages the deb produced by `crates/igdm`, see `scripts/build-flatpak.sh`)
-- `.github/workflows/build.yml` - cross-platform build + release workflow
+- `scripts/package-linux.sh` - assembles `dist/` (tarballs + normalised names)
+- `scripts/build-flatpak.sh`, `scripts/build-snap.sh` - local flatpak/snap builds
+- `flatpak/` - flatpak manifest + appstream metainfo
+- `snapcraft.yaml` (repo root: snapcraft resolves part sources from the directory it runs in) + `snap/gui/` assets
+- `.github/workflows/` - reusable build + tag release workflows
 
 ## is this slop
 

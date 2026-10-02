@@ -6,8 +6,10 @@
   "scripts": {
     "dev": "cd crates/igdm && tauri dev",
     "build": "cd crates/igdm && tauri build",
-    "build:linux": "cd crates/igdm && NO_STRIP=1 tauri build --bundles deb,rpm,appimage",
+    "build:linux": "cd crates/igdm && NO_STRIP=1 tauri build --bundles deb,rpm,appimage && cd ../.. && scripts/package-linux.sh",
     "build:flatpak": "bash scripts/build-flatpak.sh",
+    "build:snap": "bash scripts/build-snap.sh",
+    "package:linux": "bash scripts/package-linux.sh",
     "run": "cargo run -p igdm",
     "typecheck": "bun run --cwd crates/igdm/ui typecheck",
     "lint": "bun run --cwd crates/igdm/ui lint",

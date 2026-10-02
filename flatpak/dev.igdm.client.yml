@@ -1,14 +1,22 @@
 # Flatpak manifest for IG Direct.
 #
 # The module below consumes an already-built binary rather than compiling the
-# Rust/React sources inside the sandbox: CI extracts the .deb produced by the
-# `linux` job of .github/workflows/build.yml into `flatpak/stage/` and only the
-# packaging happens here. That keeps the flatpak step offline (no crates.io or
-# npm access needed) and byte-identical to the deb build.
+# Rust/React sources inside the sandbox: the `linux` job of
+# .github/workflows/build.yml uploads the portable tarball produced by
+# scripts/package-linux.sh (`bin/`, `share/` at the archive root), the flatpak
+# job unpacks it into `flatpak/stage/`, and only the packaging happens here.
+# That keeps this step offline (no crates.io or npm access) and byte-identical
+# to the .deb.
 #
+#   scripts/build-flatpak.sh [target-triple]
+#
+# which is equivalent to:
+#
+#   scripts/package-linux.sh
 #   mkdir -p flatpak/stage
-#   dpkg-deb -x target/release/bundle/deb/*.deb flatpak/stage
-#   flatpak-builder --user --force-clean --repo=flatpak/repo flatpak/build-dir flatpak/dev.igdm.client.yml
+#   tar -xzf dist/igdm-<ver>-linux-<arch>.tar.gz --strip-components=1 -C flatpak/stage
+#   flatpak-builder --user --force-clean --disable-rofiles-fuse \
+#     --repo=flatpak/repo flatpak/build-dir flatpak/dev.igdm.client.yml
 #   flatpak build-bundle flatpak/repo igdm.flatpak dev.igdm.client stable
 id: dev.igdm.client
 runtime: org.gnome.Platform
@@ -36,15 +44,15 @@ modules:
   - name: igdm
     buildsystem: simple
     build-commands:
-      - install -Dm755 usr/bin/igdm /app/bin/igdm
-      - install -Dm644 "usr/share/applications/IG Direct.desktop" /app/share/applications/dev.igdm.client.desktop
-      - sed -i 's|^Exec=.*|Exec=igdm|; s|^Icon=.*|Icon=dev.igdm.client|' /app/share/applications/dev.igdm.client.desktop
-      - install -Dm644 usr/share/icons/hicolor/32x32/apps/igdm.png /app/share/icons/hicolor/32x32/apps/dev.igdm.client.png
-      - install -Dm644 usr/share/icons/hicolor/128x128/apps/igdm.png /app/share/icons/hicolor/128x128/apps/dev.igdm.client.png
-      - install -Dm644 usr/share/icons/hicolor/256x256@2/apps/igdm.png /app/share/icons/hicolor/512x512/apps/dev.igdm.client.png
-      - install -Dm644 dev.igdm.client.metainfo.xml /app/share/metainfo/dev.igdm.client.metainfo.xml
+      - install -Dm755 bin/igdm /app/bin/igdm
+      - install -Dm644 share/applications/dev.igdm.client.desktop /app/share/applications/dev.igdm.client.desktop
+      # Flatpak exports the entry under the app id, so the icon it names has to
+      # be installed under the app id too.
+      - sed -i 's|^Icon=.*|Icon=dev.igdm.client|' /app/share/applications/dev.igdm.client.desktop
+      - install -Dm644 share/icons/hicolor/32x32/apps/igdm.png /app/share/icons/hicolor/32x32/apps/dev.igdm.client.png
+      - install -Dm644 share/icons/hicolor/128x128/apps/igdm.png /app/share/icons/hicolor/128x128/apps/dev.igdm.client.png
+      - install -Dm644 "share/icons/hicolor/256x256@2/apps/igdm.png" /app/share/icons/hicolor/512x512/apps/dev.igdm.client.png
+      - install -Dm644 share/metainfo/dev.igdm.client.metainfo.xml /app/share/metainfo/dev.igdm.client.metainfo.xml
     sources:
       - type: dir
         path: stage
-      - type: file
-        path: dev.igdm.client.metainfo.xml

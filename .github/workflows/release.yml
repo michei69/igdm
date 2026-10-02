@@ -1,0 +1,67 @@
+name: release
+
+# Tag a commit and this builds every installer through the reusable build
+# workflow, then attaches the lot to a GitHub Release:
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# Nothing is pushed to the snap store or to Flathub; both are separate, opt-in
+# steps (see the README).
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+
+  publish:
+    name: publish
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      # `gh release create` writes releases.
+      contents: write
+      # needed by actions/download-artifact when the token is restricted
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check the tag against the workspace version
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)
+          tag="${GITHUB_REF_NAME#v}"
+          # Only exact semver tags are checked; v0.1.0-rc1 is allowed to
+          # describe a build of 0.1.0.
+          if printf '%s' "$tag" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' && [ "$tag" != "$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the workspace version $version"
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum ./* > SHA256SUMS
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --generate-notes \
+            --title "$GITHUB_REF_NAME" \
+            --verify-tag
