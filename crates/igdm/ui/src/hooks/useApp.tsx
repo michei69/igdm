@@ -364,7 +364,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
       const threads = { ...s.threads };
       const ts = threads[key];
       if (ts) {
-        threads[key] = { ...ts, unread: false };
+        // Opening the chat clears the badge locally; the read receipt goes out
+        // over MQTT/HTTP and `has_newer` follows on the next inbox payload.
+        threads[key] = { ...ts, unread: false, has_newer: false };
       }
       return { ...s, threads, openKey: key };
     });

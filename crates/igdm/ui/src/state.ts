@@ -168,6 +168,9 @@ export interface DirectThread {
   input_mode: number;
   business_thread_folder?: number | null;
   read_state?: number | null;
+  /** Server flag for "this thread has newer activity". Absent when the payload
+   * doesn't report it (the badge then falls back to the seen heuristic). */
+  has_newer?: boolean | null;
   is_close_friend_thread: boolean;
   assigned_admin_id?: number | null;
   shh_mode_enabled?: boolean | null;
@@ -314,6 +317,8 @@ export interface ThreadState {
   loading_older: boolean;
   /** read_state from the thread payload */
   read_state: number;
+  /** `has_newer` from the thread payload; null when the payload omits it. */
+  has_newer: boolean | null;
   /** user_id -> last seen timestamp (epoch seconds) */
   last_seen_at: Record<string, number>;
   /** Raw IG chat theme, applied to the message pane when enabled. */
@@ -340,6 +345,7 @@ export function emptyThreadState(key: string): ThreadState {
     meta_fetching: false,
     loading_older: false,
     read_state: 0,
+    has_newer: null,
     last_seen_at: {},
     theme_data: null,
   };
@@ -391,9 +397,13 @@ export function avatarForThread(ts: ThreadState): ThreadAvatar {
   return { url: null, name: threadTitle(ts) };
 }
 
-/** instagrapi's is_seen semantics are inverted; compute from read_state and
- * per-user seen timestamps. */
+/**
+ * Unread badge. The server's `has_newer` is authoritative whenever the thread
+ * payload carries it; payloads that omit it fall back to instagrapi's inverted
+ * `read_state` plus the per-user seen timestamps.
+ */
 export function unreadFor(ts: ThreadState, viewerId: string): boolean {
+  if (ts.has_newer !== null) return ts.has_newer;
   if (ts.read_state === 1) return true;
   const meTs = ts.last_seen_at[viewerId] ?? 0;
   return Object.entries(ts.last_seen_at).some(([uid, t]) => uid !== viewerId && t > meTs);

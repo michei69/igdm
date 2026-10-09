@@ -37,6 +37,9 @@ interface Props {
    * to hand down a fresh arrow function per callback on every render, which
    * made every visible row re-render on each scroll tick. */
   row: MsgRow;
+  /** True right after a reply quote jumped to this message: runs the
+   * one-shot filter flash that marks the row (and its bubble). */
+  highlight: boolean;
   onMedia: (row: MsgRow) => void;
   onMenu: (x: number, y: number, row: MsgRow) => void;
   onReplyClick: (row: MsgRow) => void;
@@ -246,6 +249,7 @@ function ReactionsOverlay({ view }: { view: MessageView }) {
 
 export default memo(function MessageRow({
   row,
+  highlight,
   onMedia,
   onMenu,
   onReplyClick,
@@ -258,7 +262,9 @@ export default memo(function MessageRow({
   const handleReplyClick = () => onReplyClick(row);
   return (
     <div
-      className={`flex w-full items-start gap-2 px-3 ${rowPadFor(view.firstInGroup, view.lastInGroup)}`}
+      className={`flex w-full items-start gap-2 px-3 ${rowPadFor(view.firstInGroup, view.lastInGroup)} ${
+        highlight ? "reply-flash" : ""
+      }`}
       onContextMenu={(e) => {
         e.preventDefault();
         e.stopPropagation();

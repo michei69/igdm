@@ -288,3 +288,34 @@ button:disabled,
 .link-text:hover {
   text-decoration: underline;
 }
+
+/* Reply-jump highlight: a clicked reply quote scrolls its message into view and
+   this flashes the whole row (the filter also brightens the bubble inside it)
+   so it is obvious which message was jumped to. One-shot; the class is removed
+   again by MessageList once the animation is over. */
+@keyframes reply-flash {
+  0% {
+    filter: brightness(1) saturate(1);
+    background-color: transparent;
+  }
+  15% {
+    filter: brightness(1.35) saturate(1.6);
+    background-color: color-mix(in srgb, var(--color-accent) 18%, transparent);
+  }
+  100% {
+    filter: brightness(1) saturate(1);
+    background-color: transparent;
+  }
+}
+
+.reply-flash {
+  animation: reply-flash 1.5s ease-out;
+  border-radius: 12px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .reply-flash {
+    animation: none;
+    background-color: color-mix(in srgb, var(--color-accent) 18%, transparent);
+  }
+}

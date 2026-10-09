@@ -394,7 +394,13 @@ pub(crate) fn extract_user_short(data: &Value) -> UserShort {
 
 /// `extract_direct_thread`
 pub fn extract_direct_thread(data: &Value) -> DirectThread {
-    let id = get_str(data, "thread_id").unwrap_or_default();
+    // Some inbox payloads carry only `thread_v2_id`; without the fallback every
+    // such thread collapsed onto the empty key (one row for many chats, and a
+    // separate row once its real id arrived on a live message).
+    let id = get_str(data, "thread_id")
+        .filter(|id| !id.is_empty())
+        .or_else(|| get_str(data, "thread_v2_id"))
+        .unwrap_or_default();
     let mut thread = DirectThread {
         pk: get_str(data, "thread_v2_id").unwrap_or_default(),
         id,
@@ -450,6 +456,7 @@ pub fn extract_direct_thread(data: &Value) -> DirectThread {
         thread.input_mode = get_i64_m(obj, "input_mode").unwrap_or(0);
         thread.business_thread_folder = get_i64_m(obj, "business_thread_folder");
         thread.read_state = get_i64_m(obj, "read_state");
+        thread.has_newer = get_bool_m(obj, "has_newer");
         thread.is_close_friend_thread = get_bool_m(obj, "is_close_friend_thread").unwrap_or(false);
         thread.assigned_admin_id = get_i64_m(obj, "assigned_admin_id");
         thread.shh_mode_enabled = get_bool_m(obj, "shh_mode_enabled");

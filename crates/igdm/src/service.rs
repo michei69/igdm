@@ -1037,10 +1037,14 @@ impl Service {
                 .await?;
             if let Some(raw_threads) = inbox.get("threads").and_then(|t| t.as_array()) {
                 for raw in raw_threads {
+                    // Same key `extract_direct_thread` ends up with: an empty
+                    // `thread_id` must not shadow the `thread_v2_id` fallback,
+                    // or the row's nickname/avatar lookup misses.
                     let key = raw
                         .get("thread_id")
-                        .or_else(|| raw.get("thread_v2_id"))
                         .and_then(|v| v.as_str())
+                        .filter(|id| !id.is_empty())
+                        .or_else(|| raw.get("thread_v2_id").and_then(|v| v.as_str()))
                         .unwrap_or("")
                         .to_string();
                     meta.insert(key.clone(), Self::thread_meta_from_raw(raw));
@@ -1314,7 +1318,14 @@ impl Service {
         text: Option<&str>,
         thread_id: Option<&str>,
     ) {
-        let real_thread_id = msg.thread_id.clone().unwrap_or_else(|| key.clone());
+        // A broadcast response can carry `thread_id: ""`; promoting the send to
+        // that key filed the thread under an empty id (the sidebar row for the
+        // real conversation then went missing).
+        let real_thread_id = msg
+            .thread_id
+            .clone()
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(|| key.clone());
         Self::patch_sent(&mut msg, text, thread_id, viewer);
         self.emit(AppEvent::Sent {
             key,

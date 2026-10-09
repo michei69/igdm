@@ -51,6 +51,48 @@ function withThread(state: AppState, key: string, fn: (ts: ThreadState) => Threa
   return { ...state, threads };
 }
 
+/** Concat two message lists, dropping ids already present, oldest first. */
+function mergeMessageLists(base: DirectMessage[], extra: DirectMessage[]): DirectMessage[] {
+  const known = new Set(base.map((m) => m.id));
+  return [...base, ...extra.filter((m) => !known.has(m.id))].toSorted(
+    (a, b) => tsMillis(a) - tsMillis(b),
+  );
+}
+
+/** The `user:<pk>` key of a chat started from search, when `thread` is that
+ * same conversation. Groups never come from a `user:` chat. */
+function virtualKeyFor(state: AppState, thread: DirectThread): string | null {
+  if (thread.is_group) return null;
+  for (const user of thread.users) {
+    const key = `user:${user.pk}`;
+    if (state.threads[key]) return key;
+  }
+  return null;
+}
+
+/**
+ * Fold a `user:<pk>` chat (opened from search, before the server had a thread
+ * id) into its real thread. Holding both keys rendered two sidebar rows for one
+ * conversation, and the inbox/live paths only ever know the real id. The
+ * pending echoes and the open selection move over with it. `loaded` is not
+ * inherited: once a real thread exists its history still has to be fetched.
+ */
+function promoteVirtual(state: AppState, realKey: string, virtualKey: string): AppState {
+  const virtual = state.threads[virtualKey];
+  if (!virtual || realKey === virtualKey) return state;
+  const existing = state.threads[realKey];
+  const threads = { ...state.threads };
+  delete threads[virtualKey];
+  threads[realKey] = {
+    ...(existing ?? emptyThreadState(realKey)),
+    title: existing?.title || virtual.title,
+    users: existing && existing.users.length > 0 ? existing.users : virtual.users,
+    messages: mergeMessageLists(existing?.messages ?? [], virtual.messages),
+    last_activity: Math.max(existing?.last_activity ?? 0, virtual.last_activity),
+  };
+  return { ...state, threads, openKey: state.openKey === virtualKey ? realKey : state.openKey };
+}
+
 /**
  * Merge a server message into a thread's list. Server echoes of a send must
  * replace the matching `local:` echo (matched by text); known ids replace in
@@ -114,15 +156,28 @@ function mergeIncomingSorted(
 /** Merge a DirectThread into local state. */
 function upsertThread(state: AppState, thread: DirectThread, meta?: ThreadMeta): AppState {
   const key = thread.id;
-  const existing = state.threads[key] ?? emptyThreadState(key);
+  // A search-started chat may still be sitting under `user:<pk>`; the real
+  // thread id wins as soon as the inbox or a live message knows it.
+  const virtual = virtualKeyFor(state, thread);
+  const base = virtual ? promoteVirtual(state, key, virtual) : state;
+  const existing = base.threads[key] ?? emptyThreadState(key);
+  const incomingActivity = new Date(thread.last_activity_at).getTime() / 1000;
+  // A live message can land while an inbox/thread response is in flight. That
+  // response then carries older activity and used to shove the row back down
+  // the list (with its clock running backwards); its badge verdict is just as
+  // stale, so the local one is kept instead.
+  const stale = incomingActivity < existing.last_activity;
   let ts: ThreadState = {
     ...existing,
     title: threadTitleFrom(thread),
     users: thread.users,
     is_group: thread.is_group,
     pending: thread.pending,
-    last_activity: new Date(thread.last_activity_at).getTime() / 1000,
-    read_state: thread.read_state ?? 0,
+    last_activity: Math.max(existing.last_activity, incomingActivity),
+    read_state: stale ? existing.read_state : (thread.read_state ?? 0),
+    // Keep the local flag when the payload omits one: a live message marked the
+    // thread unread and a payload without the field must not undo that.
+    has_newer: stale ? existing.has_newer : (thread.has_newer ?? existing.has_newer),
     theme_data: thread.theme_data ?? null,
     last_seen_at: Object.fromEntries(
       Object.entries(thread.last_seen_at).map(([uid, info]) => [
@@ -135,13 +190,19 @@ function upsertThread(state: AppState, thread: DirectThread, meta?: ThreadMeta):
     ts = { ...ts, nicknames: meta.nicknames, avatar: meta.avatar };
   }
   if (!existing.loaded) {
-    ts = sortMessages({ ...ts, messages: thread.messages, loaded: true });
+    // Merge rather than replace: a live message (or a matching optimistic echo)
+    // may already be in the list for a thread whose page is arriving now.
+    ts = sortMessages({
+      ...ts,
+      messages: mergeMessageLists(thread.messages, existing.messages),
+      loaded: true,
+    });
   }
   // `read_state`/`last_seen_at` lag behind the read receipt the viewer just
   // sent, so recomputing the flag for the thread on screen would re-dot the
   // conversation the user is reading.
-  ts = { ...ts, unread: key === state.openKey ? false : unreadFor(ts, state.me.user_id) };
-  return withThread(state, key, () => ts);
+  ts = { ...ts, unread: key === base.openKey ? false : unreadFor(ts, base.me.user_id) };
+  return withThread(base, key, () => ts);
 }
 
 export function applyEvent(state: AppState, event: AppEvent): ReducerResult {
@@ -219,7 +280,13 @@ export function applyEvent(state: AppState, event: AppEvent): ReducerResult {
     case "LiveMessage": {
       const live = event.live;
       const liveMsg = live.message;
-      let next = state;
+      const own = live.user_id === state.me.user_id;
+      // A chat started from search lives under `user:<pk>` until the server
+      // reports a real id on a live message; fold it in so one conversation
+      // stays one sidebar row. Thread details would eventually promote it too,
+      // but this must not wait for (or depend on) that fetch.
+      const virtualKey = own ? null : `user:${live.user_id}`;
+      let next = virtualKey ? promoteVirtual(state, live.thread_id, virtualKey) : state;
       if (!next.threads[live.thread_id]) {
         next = withThread(next, live.thread_id, () => ({
           ...emptyThreadState(live.thread_id),
@@ -227,7 +294,6 @@ export function applyEvent(state: AppState, event: AppEvent): ReducerResult {
         }));
         effects.push({ kind: "thread_details", threadId: live.thread_id });
       }
-      const own = live.user_id === next.me.user_id;
       // Reaction items (like/unlike) are not messages: their ids are
       // reaction-item ids the server rejects for read receipts, and they
       // must attach to (or detach from) the target message instead of
@@ -289,7 +355,9 @@ export function applyEvent(state: AppState, event: AppEvent): ReducerResult {
               last_activity: tsMillis(msg) / 1000,
             };
             if (!own && !knownInThread) {
-              t = { ...t, unread: true };
+              // Mirror the server's own flag: the badge follows `has_newer`
+              // until the next inbox payload says the thread was read.
+              t = { ...t, unread: true, has_newer: true };
             }
           }
         }
@@ -309,7 +377,11 @@ export function applyEvent(state: AppState, event: AppEvent): ReducerResult {
         });
       }
       if (next.openKey === live.thread_id) {
-        next = withThread(next, live.thread_id, (t) => ({ ...t, unread: false }));
+        next = withThread(next, live.thread_id, (t) => ({
+          ...t,
+          unread: false,
+          has_newer: false,
+        }));
         // Only real message rows get read receipts: reaction items and
         // removes carry non-message ids the server rejects (HTTP 500).
         if (live.message && live.op !== "remove" && !liveReaction && !reactionItem) {
@@ -452,30 +524,18 @@ export function applyEvent(state: AppState, event: AppEvent): ReducerResult {
       let next = state;
       let key2 = key;
       if (key.startsWith("user:")) {
-        const virtual = next.threads[key];
-        if (virtual) {
-          // Promote the virtual thread onto its real id, keeping the messages
-          // already in it: `[msg]` used to throw away other pending echoes
-          // (and the real thread's history) as well as this send's context.
-          const threads = { ...next.threads };
-          const existingReal = threads[realThreadId];
-          const base = existingReal ?? emptyThreadState(realThreadId);
-          const promoted: ThreadState = sortMessages({
-            ...base,
-            title: base.title || virtual.title,
-            users: base.users.length > 0 ? base.users : virtual.users,
-            messages: mergeIncoming([...base.messages, ...virtual.messages], msg, {
-              localText: msg.text,
-              keepReply: true,
-            }),
+        if (next.threads[key]) {
+          // The send revealed the real thread id: promote the virtual thread
+          // onto it, keeping the messages already in it (`[msg]` used to throw
+          // away other pending echoes and the real thread's history), then
+          // replace this send's optimistic echo with the server copy.
+          next = promoteVirtual(next, realThreadId, key);
+          next = withThread(next, realThreadId, (ts) => ({
+            ...ts,
+            messages: mergeIncoming(ts.messages, msg, { localText: msg.text, keepReply: true }),
             loaded: true,
-            oldest_cursor: base.oldest_cursor,
-            has_more: base.has_more,
             last_activity: tsMillis(msg) / 1000,
-          });
-          delete threads[key];
-          threads[realThreadId] = promoted;
-          next = { ...next, threads };
+          }));
           next = { ...next, openKey: realThreadId };
           effects.push({ kind: "refresh_inbox" });
           return { state: { ...next, inboxLoading: true }, effects };
@@ -547,15 +607,21 @@ export function applyEvent(state: AppState, event: AppEvent): ReducerResult {
       const { user, threadId } = event;
       let next = state;
       if (threadId) {
-        const known = next.threads[threadId];
+        let known = next.threads[threadId];
         if (!known) {
+          // A chat opened from search may already live under `user:<pk>`: fold
+          // it into the real thread instead of leaving a second row for it.
+          next = promoteVirtual(next, threadId, `user:${user.pk}`);
+          known = next.threads[threadId];
+          if (!known) {
+            next = withThread(next, threadId, () => ({
+              ...emptyThreadState(threadId),
+              title: titleForUser(user),
+              users: [user],
+              loaded: false,
+            }));
+          }
           effects.push({ kind: "refresh_inbox" });
-          next = withThread(next, threadId, () => ({
-            ...emptyThreadState(threadId),
-            title: titleForUser(user),
-            users: [user],
-            loaded: false,
-          }));
           next = { ...next, inboxLoading: true };
         }
         next = { ...next, openKey: threadId };

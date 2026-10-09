@@ -1,7 +1,9 @@
-import { useMemo, useRef, useState, type MouseEvent, type KeyboardEvent } from "react";
+import { useMemo, useRef, useState, type KeyboardEvent, type PointerEvent } from "react";
 import type { Attachment } from "../../lib/attachment";
 
 const BARS = 44;
+/** Arrow-key seek step (fraction of the clip). */
+const KEY_STEP = 0.05;
 
 function formatTime(sec: number): string {
   const s = Math.round(sec);
@@ -18,6 +20,9 @@ export default function VoicePlayer({ att, own }: Props) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const [playing, setPlaying] = useState(false);
   const [progress, setProgress] = useState(0);
+  // While scrubbing, `timeupdate` lags a frame behind the pointer and used to
+  // snap the bars back under the cursor.
+  const scrubbingRef = useRef(false);
   const durationSec = Math.max(att.durationMs / 1000, 1);
 
   // Downsample the server waveform to a fixed bar count (peak per bucket).
@@ -45,19 +50,49 @@ export default function VoicePlayer({ att, own }: Props) {
     else a.pause();
   };
 
-  const seek = (e: MouseEvent<HTMLDivElement>) => {
+  const seekTo = (frac: number) => {
+    const clamped = Math.min(Math.max(frac, 0), 1);
     const a = audioRef.current;
-    if (!a) return;
+    if (a) a.currentTime = clamped * durationSec;
+    setProgress(clamped);
+  };
+
+  const seekFromPointer = (e: PointerEvent<HTMLDivElement>) => {
     const rect = e.currentTarget.getBoundingClientRect();
-    const frac = Math.min(Math.max((e.clientX - rect.left) / rect.width, 0), 1);
-    a.currentTime = frac * durationSec;
-    setProgress(frac);
+    seekTo((e.clientX - rect.left) / rect.width);
+  };
+
+  // Pointer capture keeps the move/up events coming to this element after the
+  // cursor leaves the waveform, so a drag only ends when the button is
+  // released — anywhere.
+  const onPointerDown = (e: PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    e.currentTarget.setPointerCapture(e.pointerId);
+    scrubbingRef.current = true;
+    seekFromPointer(e);
+  };
+
+  const onPointerMove = (e: PointerEvent<HTMLDivElement>) => {
+    if (scrubbingRef.current) seekFromPointer(e);
+  };
+
+  const endScrub = (e: PointerEvent<HTMLDivElement>) => {
+    if (!scrubbingRef.current) return;
+    scrubbingRef.current = false;
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
   };
 
   const handleKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
     if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
       toggle();
+      return;
+    }
+    if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+      e.preventDefault();
+      seekTo(progress + (e.key === "ArrowRight" ? KEY_STEP : -KEY_STEP));
     }
   };
 
@@ -78,7 +113,7 @@ export default function VoicePlayer({ att, own }: Props) {
         }}
         onTimeUpdate={(e) => {
           const a = e.currentTarget;
-          if (a.duration > 0) setProgress(a.currentTime / a.duration);
+          if (!scrubbingRef.current && a.duration > 0) setProgress(a.currentTime / a.duration);
         }}
       />
       <button
@@ -92,8 +127,12 @@ export default function VoicePlayer({ att, own }: Props) {
         {playing ? "❚❚" : "▶"}
       </button>
       <div
-        className="flex cursor-pointer items-center gap-[2.5px]"
-        onClick={seek}
+        className="flex -my-1 cursor-pointer touch-none items-center gap-[2.5px] py-1 select-none"
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={endScrub}
+        onPointerCancel={endScrub}
+        onLostPointerCapture={endScrub}
         onKeyDown={handleKeyDown}
         role="slider"
         tabIndex={0}
@@ -105,7 +144,7 @@ export default function VoicePlayer({ att, own }: Props) {
         {bars.map((v, i) => (
           <div
             key={i}
-            className={`w-[3px] rounded-full ${i / BARS <= progress ? playedCls : idleCls}`}
+            className={`w-[3px] rounded-full ${(i + 1) / BARS <= progress ? playedCls : idleCls}`}
             style={{ height: `${Math.max(2, Math.round(v * 28))}px` }}
           />
         ))}

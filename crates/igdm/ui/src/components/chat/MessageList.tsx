@@ -60,6 +60,9 @@ interface Props {
   onShare: (share: ShareAttachment) => void;
 }
 
+/** Must match the `.reply-flash` animation length in styles.css. */
+const REPLY_FLASH_MS = 1500;
+
 export default function MessageList({ onPreview, onShare }: Props) {
   const { state, updateThread, loadOlder, setReplyScroll, sendReaction } = useApp();
   const huntReply = useReplyHunt();
@@ -82,6 +85,18 @@ export default function MessageList({ onPreview, onShare }: Props) {
   const { scrollElRef, rows, virtualizer, totalSize, showJump, jumpToBottom, loadOlderIfNeeded } =
     useMessageListVirtualization({ ts, meId, openKey, loadOlder: requestOlder });
 
+  // The row the last reply-click landed on: it flashes so the jumped-to message
+  // is obvious once the smooth scroll settles. The class has to come off again
+  // for the one-shot animation to replay on the next click, hence the timer.
+  const [flashId, setFlashId] = useState<string | null>(null);
+  const flashTimer = useRef<number | null>(null);
+  useEffect(
+    () => () => {
+      if (flashTimer.current !== null) window.clearTimeout(flashTimer.current);
+    },
+    [],
+  );
+
   // Scroll to the reply target once its row exists.
   useEffect(() => {
     const target = state.replyScroll;
@@ -90,6 +105,9 @@ export default function MessageList({ onPreview, onShare }: Props) {
     if (idx >= 0) {
       virtualizer.scrollToIndex(idx, { align: "start", behavior: "smooth" });
       setReplyScroll(null, 0);
+      setFlashId(target);
+      if (flashTimer.current !== null) window.clearTimeout(flashTimer.current);
+      flashTimer.current = window.setTimeout(() => setFlashId(null), REPLY_FLASH_MS);
     }
   }, [state.replyScroll, rows, virtualizer, setReplyScroll]);
 
@@ -238,6 +256,7 @@ export default function MessageList({ onPreview, onShare }: Props) {
                 >
                   <MessageRow
                     row={row}
+                    highlight={row.key === flashId}
                     onMedia={onMedia}
                     onMenu={onMenuRow}
                     onReplyClick={onReplyClick}

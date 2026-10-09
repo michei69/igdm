@@ -307,6 +307,11 @@ pub struct DirectThread {
     pub business_thread_folder: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub read_state: Option<i64>,
+    /// Server flag for "this thread has activity the page didn't carry"; drives
+    /// the sidebar unread badge. Payloads that don't report it leave the field
+    /// absent, and the frontend falls back to its seen-timestamp heuristic.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_newer: Option<bool>,
     #[serde(skip_serializing_if = "is_false", default)]
     pub is_close_friend_thread: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
