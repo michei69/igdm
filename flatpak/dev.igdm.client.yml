@@ -39,6 +39,13 @@ finish-args:
   - --filesystem=xdg-videos:ro
   - --talk-name=org.freedesktop.Notifications
   - --talk-name=org.freedesktop.portal.Desktop
+  # Tray icon: the app registers a StatusNotifierItem with the panel's watcher
+  # and owns the item's well-known name, which carries the process id
+  # (`org.kde.StatusNotifierItem-<pid>-<id>`), hence the wildcard. Without
+  # these the tray cannot register inside the sandbox and the app falls back to
+  # closing its window normally.
+  - --talk-name=org.kde.StatusNotifierWatcher
+  - --own-name=org.kde.StatusNotifierItem-*
 
 modules:
   - name: igdm

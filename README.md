@@ -20,6 +20,7 @@ and also cuz there isnt any other 3rd party desktop client for this
 - **inbox:** threads, unread markers, avatars, search (existing chats + new 1:1s).
 - **message pane:** gradient bubbles, day separators, load-older pagination (scroll-up or banner), typing indicators, seen receipts, reactions, media/voice/GIF/post/sticker payloads.
 - **send:** text (with reply quoting), photos, videos; message-request approval.
+- **tray:** always-on tray icon - left click shows/hides the window, right click opens the Open/Exit menu. closing a window hides it instead of quitting, so the app keeps receiving messages (and notifying) while it is away.
 - **misc:** media preview overlay with download, per-message/thread "copy raw data", configurable reaction emojis (separate settings window). seen/typing published over MQTT when connected, HTTP fallback otherwise.
 
 ## setup

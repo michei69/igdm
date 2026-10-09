@@ -3,14 +3,26 @@
 #![forbid(unsafe_code)]
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use tauri::Manager;
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, Manager, WindowEvent};
 
 pub mod commands;
 pub mod service;
 pub mod state;
 
 use service::Service;
+
+/// Tray icon id — the event handlers are keyed on it.
+const TRAY_ID: &str = "ig-direct";
+
+/// Set once the tray icon exists. Closing a window only hides it while there is
+/// a tray to bring it back from; without this, a machine where the tray failed
+/// to register (no D-Bus StatusNotifier host) would leave the app running with
+/// no visible window and no way to reach it.
+static TRAY_READY: AtomicBool = AtomicBool::new(false);
 
 fn sessions_dir() -> PathBuf {
     std::env::var_os("IGDM_SESSIONS")
@@ -66,6 +78,74 @@ fn enable_media_capture(window: &tauri::WebviewWindow) {
     }
 }
 
+/// Bring the main window back: show it, un-minimise and focus it.
+fn show_main_window(app: &AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let _ = window.show();
+    let _ = window.unminimize();
+    let _ = window.set_focus();
+}
+
+/// Left click on the tray toggles the main window: one that is showing *and*
+/// focused goes back to the tray, anything else (hidden, minimised, or merely
+/// in the background) comes forward. Checking the focus as well keeps the
+/// first click after switching to another app a "bring it back" instead of a
+/// hide.
+fn toggle_main_window(app: &AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let in_front = window.is_visible().unwrap_or(false) && window.is_focused().unwrap_or(false);
+    if in_front {
+        let _ = window.hide();
+    } else {
+        show_main_window(app);
+    }
+}
+
+/// Always-on tray icon: left click toggles the window, right click opens the
+/// Open/Exit menu. The icon lives for the whole session (Tauri keeps a
+/// reference to it), which is what makes close-to-tray useful.
+fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
+    let open = MenuItem::with_id(app, "open", "Open IG Direct", true, None::<&str>)?;
+    let exit = MenuItem::with_id(app, "exit", "Exit", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&open, &exit])?;
+
+    let mut builder = TrayIconBuilder::with_id(TRAY_ID)
+        .tooltip("IG Direct")
+        .menu(&menu)
+        // Linux ignores this: the StatusNotifierItem host decides. KDE calls
+        // Activate on left click (see the handler below) and ContextMenu on
+        // right click, which is exactly the split the menu is for.
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "open" => show_main_window(app),
+            "exit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                toggle_main_window(tray.app_handle());
+            }
+        });
+
+    // The bundle icon is the window icon too; without one the tray would come
+    // up as an empty spot on the panel.
+    if let Some(icon) = app.default_window_icon() {
+        builder = builder.icon(icon.clone());
+    }
+    builder.build(app)?;
+    TRAY_READY.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("error")).init();
@@ -95,7 +175,27 @@ pub fn run() {
             if let Some(window) = app.get_webview_window("main") {
                 enable_media_capture(&window);
             }
+            // A tray that cannot be created must not keep the app from
+            // starting: without it the window simply closes as it always did.
+            if let Err(e) = setup_tray(app.handle()) {
+                log::error!("could not create the tray icon: {e}");
+            }
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            let WindowEvent::CloseRequested { api, .. } = event else {
+                return;
+            };
+            // Close to tray: hide instead of destroying the window, so the
+            // webview keeps running. It owns the MQTT connection and the
+            // notification bridge, which is what still lets notifications
+            // through while the window is away; the tray brings it back.
+            // (Without a tray the window closes and the app quits as before.)
+            if !TRAY_READY.load(Ordering::Relaxed) {
+                return;
+            }
+            api.prevent_close();
+            let _ = window.hide();
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_bootstrap,

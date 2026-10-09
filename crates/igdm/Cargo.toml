@@ -27,7 +27,7 @@ tauri-build = { version = "2.7.1", features = [] }
 # 2.12 is the first release on tao 0.37, which fixes the forced client-side
 # decorations on Wayland windows (tao-apps/tao#1046, tauri#12955, tauri#12685)
 # that this repo used to vendor a patched tao for.
-tauri = { version = "2.12.1", features = [] }
+tauri = { version = "2.12.1", features = ["tray-icon"] }
 tauri-plugin-dialog = "2.7.2"
 tauri-plugin-opener = "2.5.4"
 tauri-plugin-clipboard-manager = "2.3.2"
@@ -48,3 +48,11 @@ env_logger = "0.11"
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
 webkit2gtk = "2.0"
+# Not used from code: tauri pulls `tray-icon` in with its AppIndicator backend,
+# which on Linux never reports clicks (the panel opens the menu on any button),
+# so the tray could not toggle the window. Enabling `ksni` here switches the
+# crate to its pure-Rust StatusNotifierItem backend (cargo unifies the features
+# and tray-icon then picks ksni, warning about the pair). It needs no GTK or
+# libappindicator at runtime, and it is Linux-only so the other targets keep
+# tauri's own configuration.
+tray-icon = { version = "0.25", default-features = false, features = ["ksni"] }
