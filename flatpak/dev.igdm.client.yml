@@ -41,11 +41,13 @@ finish-args:
   - --talk-name=org.freedesktop.portal.Desktop
   # Tray icon: the app registers a StatusNotifierItem with the panel's watcher
   # and owns the item's well-known name, which carries the process id
-  # (`org.kde.StatusNotifierItem-<pid>-<id>`), hence the wildcard. Without
-  # these the tray cannot register inside the sandbox and the app falls back to
-  # closing its window normally.
+  # (`org.kde.StatusNotifierItem-<pid>-<id>`), hence the wildcard. Flatpak only
+  # takes `*` as a whole trailing element (`org.kde.*`): glued to the last one
+  # (`org.kde.StatusNotifierItem-*`) it fails finish with "Invalid dbus name".
+  # Without these the tray cannot register inside the sandbox and the app falls
+  # back to closing its window normally.
   - --talk-name=org.kde.StatusNotifierWatcher
-  - --own-name=org.kde.StatusNotifierItem-*
+  - --own-name=org.kde.*
 
 modules:
   - name: igdm
