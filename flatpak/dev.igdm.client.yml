@@ -23,6 +23,9 @@ runtime: org.gnome.Platform
 runtime-version: '50'
 sdk: org.gnome.Sdk
 command: igdm
+# flatpak-builder's own default branch is `master`, and the build-bundle step
+# below installs `stable`, so the export has to be told which one to use.
+default-branch: stable
 
 finish-args:
   - --share=network
