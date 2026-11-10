@@ -239,12 +239,17 @@ impl Client {
     }
 
     /// `_direct_message_reaction` — send or delete an emoji reaction.
-    pub async fn direct_reaction(
+    ///
+    /// `super_react_type` is IG's reaction animation selector (`NONE` for a
+    /// plain emoji, `BASIC_SUPER_REACT_ANIMATION` for the big super react).
+    pub async fn direct_react(
         &self,
         thread_id: &str,
         message_id: &str,
         emoji: &str,
         reaction_status: &str,
+        original_client_context: Option<&str>,
+        super_react_type: &str,
     ) -> Result<bool> {
         debug_assert!(reaction_status == "created" || reaction_status == "deleted");
         let token = generate_mutation_token();
@@ -273,6 +278,12 @@ impl Client {
         data.insert("node_type".to_string(), json!("item"));
         data.insert("item_id".to_string(), json!(message_id));
         data.insert("emoji".to_string(), json!(emoji));
+        if !super_react_type.is_empty() && super_react_type != "none" {
+            data.insert("super_react_type".to_string(), json!(super_react_type));
+        }
+        if let Some(cc) = original_client_context.filter(|cc| !cc.is_empty()) {
+            data.insert("original_message_client_context".to_string(), json!(cc));
+        }
         data.insert("reaction_action_source".to_string(), json!("double_tap"));
         let body = self.with_default_data(data).await;
         let result = self
@@ -283,6 +294,178 @@ impl Client {
             )
             .await?;
         Ok(result.get("status").and_then(|v| v.as_str()).unwrap_or("") == "ok")
+    }
+
+    /// Plain emoji reaction (no super react animation).
+    pub async fn direct_reaction(
+        &self,
+        thread_id: &str,
+        message_id: &str,
+        emoji: &str,
+        reaction_status: &str,
+    ) -> Result<bool> {
+        self.direct_react(thread_id, message_id, emoji, reaction_status, None, "none")
+            .await
+    }
+
+    /// Super react: an emoji reaction that plays IG's large animated overlay.
+    pub async fn direct_super_react(
+        &self,
+        thread_id: &str,
+        message_id: &str,
+        emoji: &str,
+        original_client_context: Option<&str>,
+    ) -> Result<bool> {
+        self.direct_react(
+            thread_id,
+            message_id,
+            emoji,
+            "created",
+            original_client_context,
+            "BASIC_SUPER_REACT_ANIMATION",
+        )
+        .await
+    }
+
+    /// `direct_message_edit` — `direct_v2/threads/{tid}/items/{iid}/edit/`.
+    pub async fn direct_message_edit(
+        &self,
+        thread_id: &str,
+        message_id: &str,
+        text: &str,
+        original_client_context: Option<&str>,
+    ) -> Result<bool> {
+        let uuid = self.state().await.uuid.clone();
+        let mut data = Map::new();
+        data.insert("_uuid".to_string(), json!(uuid));
+        data.insert("body".to_string(), json!(text));
+        if let Some(cc) = original_client_context.filter(|cc| !cc.is_empty()) {
+            data.insert("original_message_client_context".to_string(), json!(cc));
+        }
+        let result = self
+            .private_request(
+                &format!("direct_v2/threads/{thread_id}/items/{message_id}/edit/"),
+                Some(Body::Form(Value::Object(data))),
+                Req::default(),
+            )
+            .await?;
+        Ok(result.get("status").and_then(|v| v.as_str()).unwrap_or("") == "ok")
+    }
+
+    /// Delete one message: `for_self` removes it from the viewer's thread
+    /// only (`delete_items_locally/`), otherwise it is unsent for everyone.
+    pub async fn direct_message_delete(
+        &self,
+        thread_id: &str,
+        message_id: &str,
+        original_client_context: Option<&str>,
+        for_self: bool,
+    ) -> Result<bool> {
+        let uuid = self.state().await.uuid.clone();
+        let mut data = Map::new();
+        data.insert("_uuid".to_string(), json!(uuid));
+        let endpoint = if for_self {
+            data.insert(
+                "item_ids".to_string(),
+                json!(dumps(&Value::Array(vec![json!(message_id)]))),
+            );
+            if let Some(cc) = original_client_context.filter(|cc| !cc.is_empty()) {
+                data.insert(
+                    "original_message_client_contexts".to_string(),
+                    json!(dumps(&Value::Array(vec![json!(cc)]))),
+                );
+            }
+            format!("direct_v2/threads/{thread_id}/delete_items_locally/")
+        } else {
+            if let Some(cc) = original_client_context.filter(|cc| !cc.is_empty()) {
+                data.insert("original_message_client_context".to_string(), json!(cc));
+            }
+            format!("direct_v2/threads/{thread_id}/items/{message_id}/delete/")
+        };
+        let result = self
+            .private_request(
+                &endpoint,
+                Some(Body::Form(Value::Object(data))),
+                Req::default(),
+            )
+            .await?;
+        Ok(result.get("status").and_then(|v| v.as_str()).unwrap_or("") == "ok")
+    }
+
+    /// Mark the newest message of a thread as seen (`direct_send_seen`).
+    pub async fn direct_thread_mark_seen(&self, thread_id: &str) -> Result<bool> {
+        let mut params = Map::new();
+        params.insert("visual_message_return_type".to_string(), json!("unseen"));
+        params.insert("thread_message_limit".to_string(), json!("1"));
+        let result = self
+            .private_request(
+                &format!("direct_v2/threads/{thread_id}/"),
+                None,
+                Req::signed().params(Some(&params)),
+            )
+            .await?;
+        let item_id = result
+            .get("thread")
+            .and_then(|t| t.get("items"))
+            .and_then(|i| i.as_array())
+            .and_then(|items| {
+                items
+                    .iter()
+                    .max_by_key(|item| {
+                        item.get("timestamp_in_micro")
+                            .or_else(|| item.get("timestamp"))
+                            .and_then(|t| match t {
+                                Value::Number(n) => n.as_i64(),
+                                Value::String(s) => s.parse().ok(),
+                                _ => None,
+                            })
+                            .unwrap_or(0)
+                    })
+                    .and_then(|item| item.get("item_id").and_then(|v| v.as_str()))
+            })
+            .map(|s| s.to_string());
+        match item_id {
+            Some(item_id) => self.direct_message_seen(thread_id, &item_id).await,
+            None => Ok(false),
+        }
+    }
+
+    /// `direct_users_presence` — subscribe to and fetch live presence for
+    /// users. Returns the raw response (`user_presence` map + `user_ids`).
+    pub async fn direct_users_presence(&self, user_ids: &[i64]) -> Result<Value> {
+        let mut data = Map::new();
+        data.insert("subscriptions_off".to_string(), json!("false"));
+        data.insert(
+            "request_data".to_string(),
+            json!(dumps(&Value::Array(
+                user_ids.iter().map(|u| json!(u)).collect()
+            ))),
+        );
+        let body = self.with_default_data(data).await;
+        self.private_request(
+            "direct_v2/fetch_and_subscribe_presence/",
+            Some(Body::Form(Value::Object(body))),
+            Req::default(),
+        )
+        .await
+    }
+
+    /// `direct_active_presence` — the active-now snapshot (`user_presence`).
+    pub async fn direct_active_presence(&self) -> Result<Value> {
+        let mut params = Map::new();
+        params.insert("recent_thread_limit".to_string(), json!("0"));
+        params.insert("suggested_followers_limit".to_string(), json!("100"));
+        let result = self
+            .private_request(
+                "direct_v2/get_presence_active_now/",
+                None,
+                Req::default().params(Some(&params)),
+            )
+            .await?;
+        Ok(result
+            .get("user_presence")
+            .cloned()
+            .unwrap_or_else(|| result.clone()))
     }
 
     /// `direct_message_seen` — HTTP mark-seen.

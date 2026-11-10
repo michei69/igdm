@@ -607,17 +607,24 @@ impl RealtimeClient {
         let direct_payload: Value = match message {
             Value::String(s) => serde_json::from_str(s).unwrap_or_else(|_| json!({"value": s})),
             Value::Object(m) => {
-                if m.get("topic").and_then(|t| t.as_str()) != Some("direct") {
-                    return;
-                }
+                let topic = m.get("topic").and_then(|t| t.as_str());
                 let inner = m.get("json").or_else(|| m.get("payload"));
-                match inner {
+                let parsed = match inner {
                     Some(Value::String(s)) => {
                         serde_json::from_str(s).unwrap_or_else(|_| json!({"value": s}))
                     }
                     Some(other) => other.clone(),
                     None => Value::Null,
+                };
+                if topic != Some("direct") {
+                    // Presence subscriptions arrive on their own everclear
+                    // app id; the message payload is the only presence signal.
+                    if !crate::extract::extract_presence(&parsed).is_empty() {
+                        self.emit("presence", parsed);
+                    }
+                    return;
                 }
+                parsed
             }
             _ => return,
         };

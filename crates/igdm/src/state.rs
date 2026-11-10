@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use instagrapi::types::{DirectMessage, DirectThread, UserShort};
+use instagrapi::types::{DirectMessage, DirectThread, PresenceEntry, UserShort};
 use serde::Serialize;
 
 /// Per-thread metadata parsed from raw payloads (`_thread_meta_from_raw`).
@@ -53,6 +53,12 @@ pub enum AppEvent {
     LiveMessage(LiveMessage),
     Typing(String, String, bool),
     Seen(String, String, String),
+    /// Live presence snapshot (`user_presence` entries) for any users.
+    Presence(Vec<PresenceEntry>),
+    /// A message was edited: (thread id, item id, new text).
+    MessageEdited(String, String, String),
+    /// A message was deleted/unsent: (thread id, item id).
+    MessageDeleted(String, String),
     ThreadsLoaded(Vec<DirectThread>, HashMap<String, ThreadMeta>),
     ThreadDetails(String, DirectThread, ThreadMeta),
     MessagesLoaded(String, Vec<DirectMessage>, Option<String>, bool),
@@ -88,6 +94,9 @@ impl AppEvent {
             AppEvent::LiveMessage(..) => "LiveMessage",
             AppEvent::Typing(..) => "Typing",
             AppEvent::Seen(..) => "Seen",
+            AppEvent::Presence(..) => "Presence",
+            AppEvent::MessageEdited(..) => "MessageEdited",
+            AppEvent::MessageDeleted(..) => "MessageDeleted",
             AppEvent::ThreadsLoaded(..) => "ThreadsLoaded",
             AppEvent::ThreadDetails(..) => "ThreadDetails",
             AppEvent::MessagesLoaded(..) => "MessagesLoaded",
@@ -130,6 +139,9 @@ impl serde::Serialize for AppEvent {
             AppEvent::LiveMessage(live) => s.serialize_entry("data", &(live,))?,
             AppEvent::Typing(a, b, c) => s.serialize_entry("data", &(a, b, c))?,
             AppEvent::Seen(a, b, c) => s.serialize_entry("data", &(a, b, c))?,
+            AppEvent::Presence(entries) => s.serialize_entry("data", &(entries,))?,
+            AppEvent::MessageEdited(a, b, c) => s.serialize_entry("data", &(a, b, c))?,
+            AppEvent::MessageDeleted(a, b) => s.serialize_entry("data", &(a, b))?,
             AppEvent::ThreadsLoaded(threads, meta) => {
                 s.serialize_entry("data", &serde_json::json!([threads, meta]))?
             }

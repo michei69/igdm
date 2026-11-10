@@ -112,7 +112,12 @@ pub fn thread_details(state: State<'_, SharedService>, thread_id: String) {
         // Failures used to be dropped entirely: an expired session or a rate
         // limit left the chat stuck on its loading state with no explanation.
         match svc.thread_details(&thread_id).await {
-            Ok((thread, meta, _raw)) => svc.emit_thread_details(thread_id2, thread, meta),
+            Ok((thread, meta, _raw)) => {
+                let users = thread.users.iter().map(|u| u.pk.clone()).collect();
+                svc.emit_thread_details(thread_id2, thread, meta);
+                // Presence for the people in this thread ("Active now").
+                svc.presence_for_users(users);
+            }
             Err(e) => svc.emit_load_failed(
                 thread_id2,
                 format!("Couldn't load thread: {}", crate::service::err_text(&e)),
@@ -292,8 +297,44 @@ pub fn send_reaction(
     message_id: String,
     emoji: String,
     delete: bool,
+    super_react_type: Option<String>,
+    client_context: Option<String>,
 ) {
-    state.send_reaction(thread_id, message_id, emoji, delete);
+    state.send_reaction(
+        thread_id,
+        message_id,
+        emoji,
+        delete,
+        super_react_type,
+        client_context,
+    );
+}
+
+#[tauri::command]
+pub fn edit_message(
+    state: State<'_, SharedService>,
+    thread_id: String,
+    message_id: String,
+    text: String,
+    client_context: Option<String>,
+) {
+    state.edit_message(thread_id, message_id, text, client_context);
+}
+
+#[tauri::command]
+pub fn delete_message(
+    state: State<'_, SharedService>,
+    thread_id: String,
+    message_id: String,
+    client_context: Option<String>,
+    for_self: bool,
+) {
+    state.delete_message(thread_id, message_id, client_context, for_self);
+}
+
+#[tauri::command]
+pub fn mark_thread_seen(state: State<'_, SharedService>, thread_id: String) {
+    state.mark_thread_seen(thread_id);
 }
 
 #[tauri::command]

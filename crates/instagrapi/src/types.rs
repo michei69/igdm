@@ -250,10 +250,28 @@ pub struct DirectMessage {
     pub action_log: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_context: Option<String>,
+    /// True when the sender edited this message after sending it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_edited: Option<bool>,
+    /// Edited text/timestamp fields the server returns alongside the item.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edit_text: Option<String>,
+    /// True when the item was deleted/unsent (for everyone or for the viewer).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_deleted: Option<bool>,
     /// The verbatim server payload for this message item. Used by "copy raw
     /// data" and for rendering message types the model does not cover.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw: Option<Value>,
+}
+
+/// One user's live presence (`user_presence` entry from the presence endpoint).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PresenceEntry {
+    pub user_id: String,
+    pub is_active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_active_ms: Option<i64>,
 }
 
 /// Last-seen info per user inside a thread (`LastSeenInfo`).

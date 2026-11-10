@@ -5,7 +5,7 @@ use serde_json::{json, Map, Value};
 
 use crate::types::{
     Account, DirectMedia, DirectMessage, DirectThread, LastSeenInfo, MessageReaction,
-    MessageReactions, User, UserShort,
+    MessageReactions, PresenceEntry, User, UserShort,
 };
 use crate::utils::{get, get_bool, get_bool_m, get_i64, get_i64_m, get_str, get_str_m};
 
@@ -306,6 +306,15 @@ pub fn extract_direct_message(data: &Value) -> DirectMessage {
         msg.is_sent_by_viewer = get_bool_m(obj, "is_sent_by_viewer");
         msg.is_shh_mode = get_bool_m(obj, "is_shh_mode");
         msg.client_context = get_str_m(obj, "client_context").filter(|s| !s.is_empty());
+        // Edit state: the server reports it as a flag, an edit counter or the
+        // edited text itself depending on the payload source (thread page vs
+        // realtime patch).
+        msg.edit_text = get_str_m(obj, "edited_text").or_else(|| get_str_m(obj, "edit_text"));
+        msg.is_edited = get_bool_m(obj, "is_edited")
+            .or_else(|| (get_i64_m(obj, "edit_count").unwrap_or(0) > 0).then_some(true))
+            .or_else(|| msg.edit_text.as_ref().map(|_| true));
+        msg.is_deleted =
+            get_bool_m(obj, "is_deleted").or_else(|| get_bool_m(obj, "is_deleted_for_self"));
         msg.text = get_str_m(obj, "text");
         // `link` items carry the URL inside `link.text`, not at the top
         // level; surface it as the message text so links render as normal
@@ -480,6 +489,84 @@ pub fn extract_direct_thread(data: &Value) -> DirectThread {
     }
     thread.theme_data = data.get("theme_data").filter(|v| !v.is_null()).cloned();
     thread
+}
+
+/// Presence entries from any of the presence payload shapes: the
+/// `fetch_and_subscribe_presence` response (`user_presence` map), the
+/// `get_presence_active_now` body (a bare map), a single entry, or a realtime
+/// patch (`user_id`/`user_ids` + `is_active`).
+pub fn extract_presence(data: &Value) -> Vec<PresenceEntry> {
+    fn int_of(value: &Value) -> Option<i64> {
+        match value {
+            Value::Number(n) => n.as_i64(),
+            Value::String(s) => s.parse::<i64>().ok(),
+            _ => None,
+        }
+    }
+    fn entry_of(uid: &str, value: &Value) -> PresenceEntry {
+        let is_active = get_bool(value, "is_active")
+            .or_else(|| get_bool(value, "active"))
+            .unwrap_or(false);
+        PresenceEntry {
+            user_id: get_str(value, "user_id").unwrap_or_else(|| uid.to_string()),
+            is_active,
+            last_active_ms: value
+                .get("last_active_ms")
+                .or_else(|| value.get("last_activity_at_ms"))
+                .and_then(int_of),
+        }
+    }
+
+    // Realtime patch first: `{user_id|user_ids, is_active, last_activity_at_ms}`.
+    let active = get_bool(data, "is_active").or_else(|| get_bool(data, "active"));
+    let mut realtime_ids: Vec<String> = Vec::new();
+    if let Some(one) = get_str(data, "user_id").filter(|s| !s.is_empty()) {
+        realtime_ids.push(one);
+    }
+    if let Some(arr) = data.get("user_ids").and_then(|v| v.as_array()) {
+        for v in arr {
+            match v {
+                Value::String(s) => realtime_ids.push(s.clone()),
+                Value::Number(n) => realtime_ids.push(n.to_string()),
+                _ => {}
+            }
+        }
+    }
+    if !realtime_ids.is_empty() && active.is_some() {
+        return realtime_ids
+            .into_iter()
+            .map(|user_id| PresenceEntry {
+                user_id,
+                is_active: active.unwrap_or(false),
+                last_active_ms: data
+                    .get("last_active_ms")
+                    .or_else(|| data.get("last_activity_at_ms"))
+                    .and_then(int_of),
+            })
+            .collect();
+    }
+
+    let root = data.get("user_presence").unwrap_or(data);
+    let mut entries = Vec::new();
+    if let Some(map) = root.as_object() {
+        if map.contains_key("is_active") || map.contains_key("active") {
+            entries.push(entry_of("", root));
+        } else {
+            for (uid, value) in map {
+                if value.is_object() {
+                    entries.push(entry_of(uid, value));
+                }
+            }
+        }
+    } else if let Some(arr) = root.as_array() {
+        for value in arr {
+            if value.is_object() {
+                entries.push(entry_of("", value));
+            }
+        }
+    }
+    entries.retain(|e| !e.user_id.is_empty());
+    entries
 }
 
 /// `extract_account`

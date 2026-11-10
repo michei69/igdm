@@ -9,7 +9,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use instagrapi::error::{ErrorKind, IgError};
-use instagrapi::extract::{extract_direct_message, extract_direct_thread};
+use instagrapi::extract::{extract_direct_message, extract_direct_thread, extract_presence};
 use instagrapi::realtime::RealtimeClient;
 use instagrapi::types::{DirectMessage, DirectThread, UserShort};
 use instagrapi::{Client, Result};
@@ -532,7 +532,9 @@ impl Service {
             user_id,
             profile_pic_url,
         }));
-        self.start_realtime(self.epoch.load(Ordering::SeqCst));
+        let epoch = self.epoch.load(Ordering::SeqCst);
+        self.start_realtime(epoch);
+        self.start_presence_poll(epoch);
     }
 
     pub fn logout(&self) {
@@ -612,6 +614,8 @@ impl Service {
         rt.on("typing", move |payload| svc.on_typing(payload));
         let svc = self.clone();
         rt.on("seen", move |payload| svc.on_seen(payload));
+        let svc = self.clone();
+        rt.on("presence", move |payload| svc.on_presence(payload));
         rt.direct_subscribe().await?;
         *self.realtime.lock().await = Some(rt.clone());
         Ok(rt)
@@ -795,7 +799,15 @@ impl Service {
         if path.contains("/reactions/") {
             return; // reaction patches ride the realtime `reaction` channel
         }
-        let item_id = path.rsplit('/').next().unwrap_or("").to_string();
+        // Item ids ride the path (`/items/{id}`, `/items/{id}/edit`).
+        let item_id = path
+            .split('/')
+            .collect::<Vec<_>>()
+            .windows(2)
+            .find(|w| w[0] == "items")
+            .and_then(|w| w.get(1).copied())
+            .unwrap_or("")
+            .to_string();
         let mut value = Map::new();
         for (k, v) in obj {
             if k != "path" && k != "op" && k != "thread_id" {
@@ -804,27 +816,53 @@ impl Service {
         }
         let value = Value::Object(value);
         let dm = extract_direct_message(&value);
-
-        if op == "remove" {
-            // Keep the payload: a remove can be an un-reaction (bare
-            // `{emoji, message_id}` echo) rather than a deleted message row;
-            // the reducer needs it to strip the reaction correctly.
-            self.emit(AppEvent::LiveMessage(Self::live_message(
-                thread_id.to_string(),
-                item_id,
-                op,
-                dm,
-                None,
-                now_secs(),
-            )));
-            return;
-        }
-
         let item_id = if dm.id.is_empty() {
             item_id
         } else {
             dm.id.clone()
         };
+
+        // Deleted/unsent rows: the patch is either `op=remove` or an item
+        // carrying `is_deleted` (for everyone or for this viewer only).
+        if op == "remove" || dm.is_deleted == Some(true) || path.ends_with("/delete") {
+            // Un-reaction echoes also ride the message channel as a bare
+            // `{emoji, message_id}` remove. They are not deleted rows: the
+            // reducer needs the payload to strip the reaction pill.
+            let reaction_echo = dm.is_deleted != Some(true)
+                && op == "remove"
+                && (dm.item_type.as_deref() == Some("direct_reaction")
+                    || (value.get("emoji").is_some() && value.get("message_id").is_some()));
+            if reaction_echo {
+                self.emit(AppEvent::LiveMessage(Self::live_message(
+                    thread_id.to_string(),
+                    item_id,
+                    op,
+                    dm,
+                    None,
+                    now_secs(),
+                )));
+            } else if !item_id.is_empty() {
+                self.emit(AppEvent::MessageDeleted(thread_id.to_string(), item_id));
+            }
+            return;
+        }
+
+        // Edits: a replacement patch for an existing item, or the edit marker
+        // fields. They only carry the new text; emitting a LiveMessage would
+        // overwrite the row with a partial payload.
+        let is_edit = dm.is_edited == Some(true)
+            || path.ends_with("/edit")
+            || (op == "replace" && dm.text.is_some());
+        if is_edit {
+            if let Some(text) = dm.edit_text.clone().or_else(|| dm.text.clone()) {
+                self.emit(AppEvent::MessageEdited(
+                    thread_id.to_string(),
+                    item_id,
+                    text,
+                ));
+            }
+            return;
+        }
         // `LiveMessage.text` and `message.text` are independent owned fields
         // both consumed by the frontend — the text value is duplicated once.
         let text = dm.text.clone();
@@ -930,6 +968,83 @@ impl Service {
                 user_id,
                 item_id.to_string(),
             ));
+        }
+        // Some patches carry the whole `last_seen_at` map (thread-level read
+        // state) instead of one participant's item id.
+        if !thread_id.is_empty() {
+            if let Some(seen) = value
+                .and_then(|v| v.get("last_seen_at"))
+                .and_then(|v| v.as_object())
+            {
+                for (uid, info) in seen {
+                    let seen_item = info.get("item_id").and_then(|v| v.as_str()).unwrap_or("");
+                    if uid.is_empty() || seen_item.is_empty() {
+                        continue;
+                    }
+                    self.emit(AppEvent::Seen(
+                        thread_id.to_string(),
+                        uid.clone(),
+                        seen_item.to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ presence
+
+    /// Active-now snapshot: users IG reports as currently active.
+    async fn refresh_presence(&self) {
+        match self.client.direct_active_presence().await {
+            Ok(value) => {
+                let entries = extract_presence(&value);
+                if !entries.is_empty() {
+                    self.emit(AppEvent::Presence(entries));
+                }
+            }
+            Err(e) => log::debug!("[igdm] presence refresh failed: {}", err_text(&e)),
+        }
+    }
+
+    /// Fetch presence for a specific set of users (e.g. the participants of
+    /// the thread the user just opened).
+    pub fn presence_for_users(&self, user_ids: Vec<String>) {
+        let ids: Vec<i64> = user_ids.iter().filter_map(|pk| pk.parse().ok()).collect();
+        if ids.is_empty() {
+            return;
+        }
+        let svc = self.clone();
+        self.spawn(async move {
+            if let Ok(value) = svc.client.direct_users_presence(&ids).await {
+                let entries = extract_presence(&value);
+                if !entries.is_empty() {
+                    svc.emit(AppEvent::Presence(entries));
+                }
+            }
+        });
+    }
+
+    /// Poll the active-now snapshot once a minute while this session lives.
+    fn start_presence_poll(&self, epoch: u64) {
+        let svc = self.clone();
+        self.spawn(async move {
+            loop {
+                svc.refresh_presence().await;
+                for _ in 0..60 {
+                    if !svc.running.load(Ordering::SeqCst) || !svc.is_current(epoch) {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        });
+    }
+
+    fn on_presence(&self, payload: Value) {
+        let value = payload.get("value").unwrap_or(&payload);
+        let entries = extract_presence(value);
+        if !entries.is_empty() {
+            self.emit(AppEvent::Presence(entries));
         }
     }
 
@@ -1542,13 +1657,26 @@ impl Service {
         message_id: String,
         emoji: String,
         delete: bool,
+        super_react_type: Option<String>,
+        client_context: Option<String>,
     ) {
         let svc = self.clone();
         self.spawn(async move {
             let status = if delete { "deleted" } else { "created" };
+            let super_react = super_react_type
+                .as_deref()
+                .filter(|t| !t.is_empty() && *t != "none")
+                .unwrap_or("none");
             match svc
                 .client
-                .direct_reaction(&thread_id, &message_id, &emoji, status)
+                .direct_react(
+                    &thread_id,
+                    &message_id,
+                    &emoji,
+                    status,
+                    client_context.as_deref(),
+                    super_react,
+                )
                 .await
             {
                 Ok(_) => {}
@@ -1560,6 +1688,101 @@ impl Service {
                         err_text(&e)
                     ),
                 )),
+            }
+        });
+    }
+
+    /// Edit one of the viewer's text messages.
+    pub fn edit_message(
+        &self,
+        thread_id: String,
+        message_id: String,
+        text: String,
+        client_context: Option<String>,
+    ) {
+        let svc = self.clone();
+        self.spawn(async move {
+            let result = match (
+                checked_thread_id(&thread_id),
+                checked_id("message id", &message_id),
+            ) {
+                (Ok(thread_id), Ok(message_id)) => {
+                    svc.client
+                        .direct_message_edit(
+                            thread_id,
+                            message_id,
+                            &text,
+                            client_context.as_deref(),
+                        )
+                        .await
+                }
+                (Err(e), _) | (_, Err(e)) => Err(e),
+            };
+            match result {
+                Ok(true) => svc.emit(AppEvent::MessageEdited(thread_id, message_id, text)),
+                Ok(false) => svc.emit(AppEvent::SendFailed(
+                    thread_id,
+                    "Couldn't edit message: unknown error".into(),
+                )),
+                Err(e) => svc.emit(AppEvent::SendFailed(
+                    thread_id,
+                    format!("Couldn't edit message: {}", err_text(&e)),
+                )),
+            }
+        });
+    }
+
+    /// Delete/unsend one message (`for_self` removes it for the viewer only).
+    pub fn delete_message(
+        &self,
+        thread_id: String,
+        message_id: String,
+        client_context: Option<String>,
+        for_self: bool,
+    ) {
+        let svc = self.clone();
+        self.spawn(async move {
+            let result = match (
+                checked_thread_id(&thread_id),
+                checked_id("message id", &message_id),
+            ) {
+                (Ok(thread_id), Ok(message_id)) => {
+                    svc.client
+                        .direct_message_delete(
+                            thread_id,
+                            message_id,
+                            client_context.as_deref(),
+                            for_self,
+                        )
+                        .await
+                }
+                (Err(e), _) | (_, Err(e)) => Err(e),
+            };
+            match result {
+                Ok(true) => svc.emit(AppEvent::MessageDeleted(thread_id, message_id)),
+                Ok(false) => svc.emit(AppEvent::SendFailed(
+                    thread_id,
+                    "Couldn't delete message: unknown error".into(),
+                )),
+                Err(e) => svc.emit(AppEvent::SendFailed(
+                    thread_id,
+                    format!("Couldn't delete message: {}", err_text(&e)),
+                )),
+            }
+        });
+    }
+
+    /// Mark a whole thread as read (newest message seen) — used by the inbox
+    /// row's "Mark as read" action without opening the chat.
+    pub fn mark_thread_seen(&self, thread_id: String) {
+        let svc = self.clone();
+        self.spawn(async move {
+            let result = match checked_thread_id(&thread_id) {
+                Ok(thread_id) => svc.client.direct_thread_mark_seen(thread_id).await,
+                Err(e) => Err(e),
+            };
+            if let Err(e) = result {
+                log::error!("[igdm] mark_thread_seen failed (thread {thread_id}): {e}");
             }
         });
     }
