@@ -4,8 +4,15 @@ import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { toast } from "sonner";
 import { useDebouncedCallback } from "use-debounce";
 import { useApp } from "../../hooks/useApp";
-import { threadTitle, titleForUser, type ThreadState, type UserShort } from "../../state";
+import {
+  threadTitle,
+  titleForUser,
+  type AppState,
+  type ThreadState,
+  type UserShort,
+} from "../../state";
 import Avatar from "../common/Avatar";
+import { presenceActive } from "../common/presence";
 import ContextMenu, { MenuItem } from "../common/ContextMenu";
 import ThreadRow from "./ThreadRow";
 import { lastMessageFrom, threadViewFromState, type ThreadView } from "../../lib/threadView";
@@ -38,10 +45,12 @@ function statusLineFor(connected: boolean, detail: string): StatusLine {
 function SearchResults({
   searching,
   results,
+  presence,
   onPress,
 }: {
   searching: boolean;
   results: UserShort[];
+  presence: AppState["presence"];
   onPress: (key: string) => void;
 }) {
   if (searching) return <div className="px-3 py-2 text-[12px] text-ink3">Searching…</div>;
@@ -62,6 +71,7 @@ function SearchResults({
             unread: false,
           }}
           selected={false}
+          active={presenceActive(presence, u.pk)}
           onPress={onPress}
         />
       ))}
@@ -79,7 +89,7 @@ function ThreadList({
 }: {
   parentRef: RefObject<HTMLDivElement | null>;
   virtualizer: ReactVirtualizer<HTMLDivElement, Element>;
-  threadViews: { key: string; view: ThreadView; selected: boolean }[];
+  threadViews: { key: string; view: ThreadView; selected: boolean; active: boolean }[];
   showSkeleton: boolean;
   onPress: (key: string) => void;
   onSecondary: (key: string, x: number, y: number) => void;
@@ -117,6 +127,7 @@ function ThreadList({
                 <ThreadRow
                   view={threadView.view}
                   selected={threadView.selected}
+                  active={threadView.active}
                   onPress={onPress}
                   onSecondary={onSecondary}
                 />
@@ -134,6 +145,7 @@ export default function Sidebar() {
     state,
     openThread,
     markSeen,
+    markThreadSeen,
     loadMessages,
     threadDetails,
     updateThread,
@@ -210,8 +222,11 @@ export default function Sidebar() {
       key: ts.key,
       view: threadViewFromState(ts),
       selected: ts.key === openKey,
+      // The green dot is only meaningful for 1:1 chats; group rows have no
+      // single "other participant" to be active.
+      active: !ts.is_group && ts.users.length > 0 && presenceActive(state.presence, ts.users[0].pk),
     }));
-  }, [threads, openKey]);
+  }, [threads, openKey, state.presence]);
 
   const onSearchClick = useCallback(
     (key: string) => {
@@ -241,6 +256,14 @@ export default function Sidebar() {
         focus: true,
       });
     });
+  };
+
+  const markThreadRead = (key: string) => {
+    setThreadMenu(null);
+    if (key.startsWith("user:")) return;
+    // Clear the badge immediately; the backend receipt follows via `Seen`.
+    updateThread(key, (t) => ({ ...t, unread: false, has_newer: false }));
+    markThreadSeen(key);
   };
 
   const copyThreadRaw = (key: string) => {
@@ -319,6 +342,7 @@ export default function Sidebar() {
           <SearchResults
             searching={state.searching}
             results={state.searchResults}
+            presence={state.presence}
             onPress={onSearchClick}
           />
         ) : (
@@ -356,6 +380,11 @@ export default function Sidebar() {
 
       {threadMenu && (
         <ContextMenu x={threadMenu.x} y={threadMenu.y} onClose={() => setThreadMenu(null)}>
+          <MenuItem
+            label="Mark as read"
+            disabled={threadMenu.key.startsWith("user:")}
+            onSelect={() => markThreadRead(threadMenu.key)}
+          />
           <MenuItem label="Copy raw data" onSelect={() => copyThreadRaw(threadMenu.key)} />
         </ContextMenu>
       )}

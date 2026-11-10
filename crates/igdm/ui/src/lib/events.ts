@@ -11,6 +11,7 @@ import type {
   DirectThread,
   LiveMessage,
   MeInfo,
+  PresenceEntry,
   ThreadMeta,
   UserShort,
 } from "../state";
@@ -60,6 +61,21 @@ export function decodeEvent(wire: WireEvent): AppEvent {
       // SAFETY: Seen serializes as [threadId, userId, itemId].
       const [threadId, userId, itemId] = wire.data as [string, string, string];
       return { type: "Seen", threadId, userId, itemId };
+    }
+    case "Presence": {
+      // SAFETY: Presence serializes as [entries].
+      const [entries] = wire.data as [PresenceEntry[]];
+      return { type: "Presence", entries };
+    }
+    case "MessageEdited": {
+      // SAFETY: MessageEdited serializes as [threadId, itemId, text].
+      const [threadId, itemId, text] = wire.data as [string, string, string];
+      return { type: "MessageEdited", threadId, itemId, text };
+    }
+    case "MessageDeleted": {
+      // SAFETY: MessageDeleted serializes as [threadId, itemId].
+      const [threadId, itemId] = wire.data as [string, string];
+      return { type: "MessageDeleted", threadId, itemId };
     }
     case "ThreadsLoaded": {
       // SAFETY: ThreadsLoaded serializes as [threads, meta].

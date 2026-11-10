@@ -15,6 +15,7 @@ import ApproveBar from "./chat/ApproveBar";
 import MessageList from "./chat/MessageList";
 import Composer from "./chat/Composer";
 import ShareModal from "./chat/ShareModal";
+import { useEditSession } from "./chat/useEditSession";
 import { useRemoteImage } from "../hooks/useRemoteImage";
 import type { MediaPreview, ShareAttachment } from "../lib/attachment";
 import { pickThreadTheme, themeBackgroundUrl, threadThemeVars } from "../lib/chatTheme";
@@ -28,6 +29,9 @@ export default function MainScreen() {
 
   const [preview, setPreview] = useState<MediaPreview | null>(null);
   const [share, setShare] = useState<ShareAttachment | null>(null);
+  // Edit session (view-layer state): the message list starts it from the
+  // context menu; the composer prefills, saves and cancels it.
+  const { editing, startEdit, cancelEdit } = useEditSession(openKey, state.threads, setReply);
 
   const replyBar = state.reply && state.reply.threadKey === openKey ? state.reply : null;
 
@@ -88,7 +92,7 @@ export default function MainScreen() {
                 </p>
               </div>
             ) : (
-              <MessageList onPreview={setPreview} onShare={setShare} />
+              <MessageList onPreview={setPreview} onShare={setShare} onEdit={startEdit} />
             )}
           </div>
 
@@ -113,7 +117,7 @@ export default function MainScreen() {
             </div>
           )}
 
-          <Composer />
+          <Composer key={editing?.msgId ?? "compose"} editing={editing} onCancelEdit={cancelEdit} />
         </div>
       </Panel>
 

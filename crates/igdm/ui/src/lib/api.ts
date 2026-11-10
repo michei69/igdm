@@ -51,12 +51,35 @@ export const api = {
   sendPhotoBytes: (threadId: string, data: Uint8Array, ext: string) =>
     invoke<void>("send_photo_bytes", { threadId, data, ext }),
   sendVideo: (threadId: string, path: string) => invoke<void>("send_video", { threadId, path }),
-  sendReaction: (threadId: string, messageId: string, emoji: string, del: boolean) =>
-    invoke<void>("send_reaction", { threadId, messageId, emoji, delete: del }),
+  sendReaction: (
+    threadId: string,
+    messageId: string,
+    emoji: string,
+    del: boolean,
+    superReactType?: string | null,
+    clientContext?: string | null,
+  ) =>
+    invoke<void>("send_reaction", {
+      threadId,
+      messageId,
+      emoji,
+      delete: del,
+      superReactType,
+      clientContext,
+    }),
   sendVoice: (threadId: string, data: Uint8Array, ext: string) =>
     invoke<void>("send_voice", { threadId, data, ext }),
   markSeen: (threadId: string, itemId: string, raw?: Json) =>
     invoke<void>("mark_seen", { threadId, itemId, raw }),
+  markThreadSeen: (threadId: string) => invoke<void>("mark_thread_seen", { threadId }),
+  editMessage: (threadId: string, messageId: string, text: string, clientContext?: string | null) =>
+    invoke<void>("edit_message", { threadId, messageId, text, clientContext }),
+  deleteMessage: (
+    threadId: string,
+    messageId: string,
+    clientContext: string | null,
+    forSelf: boolean,
+  ) => invoke<void>("delete_message", { threadId, messageId, clientContext, forSelf }),
   sendTyping: (threadId: string, active: boolean) =>
     invoke<void>("send_typing", { threadId, active }),
   downloadMedia: (url: string) => invoke<void>("download_media", { url }),

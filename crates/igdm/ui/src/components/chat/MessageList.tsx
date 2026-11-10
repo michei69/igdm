@@ -1,14 +1,5 @@
-import {
-  forwardRef,
-  useCallback,
-  useEffect,
-  useImperativeHandle,
-  useRef,
-  useState,
-  type CSSProperties,
-} from "react";
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { toast } from "sonner";
 import { useApp } from "../../hooks/useApp";
 import { useReplyHunt } from "../../hooks/useReplyHunt";
 import type { DirectMessage, ThreadState } from "../../state";
@@ -19,14 +10,16 @@ import {
   type MediaPreview,
   type ShareAttachment,
 } from "../../lib/attachment";
-import { emojiDisplay } from "../../lib/format";
-import { copyClipboard } from "../../lib/clipboard";
-import { senderOf, type MsgRow } from "../../lib/buildRows";
+import { type MsgRow } from "../../lib/buildRows";
 import { threadWithReaction, toggleReaction } from "../../lib/reactions";
 import MessageRow from "./MessageRow";
+import DeleteSheet from "./DeleteSheet";
+import { MenuHost, type MenuHostHandle } from "./MessageMenu";
 import DateSeparator from "../common/DateSeparator";
-import ContextMenu, { MenuItem } from "../common/ContextMenu";
 import { useMessageListVirtualization } from "./useMessageListVirtualization";
+import { useFreshMessages } from "./useFreshMessages";
+import { useSuperBursts } from "./useSuperBursts";
+import { useDeleteFlow } from "./useDeleteFlow";
 
 /** Small video/phone glyph for call-event system rows. */
 function CallIcon({ kind }: { kind: "video" | "audio" }) {
@@ -55,15 +48,17 @@ function CallIcon({ kind }: { kind: "video" | "audio" }) {
   );
 }
 
-interface Props {
-  onPreview: (preview: MediaPreview) => void;
-  onShare: (share: ShareAttachment) => void;
-}
-
 /** Must match the `.reply-flash` animation length in styles.css. */
 const REPLY_FLASH_MS = 1500;
 
-export default function MessageList({ onPreview, onShare }: Props) {
+interface Props {
+  onPreview: (preview: MediaPreview) => void;
+  onShare: (share: ShareAttachment) => void;
+  /** Own text message selected for editing: MainScreen owns the composer state. */
+  onEdit: (msg: DirectMessage) => void;
+}
+
+export default function MessageList({ onPreview, onShare, onEdit }: Props) {
   const { state, updateThread, loadOlder, setReplyScroll, sendReaction } = useApp();
   const huntReply = useReplyHunt();
   const openKey = state.openKey;
@@ -80,10 +75,14 @@ export default function MessageList({ onPreview, onShare }: Props) {
     [updateThread, loadOlder],
   );
 
-  const menuHostRef = useRef<{ open: (x: number, y: number, msg: DirectMessage) => void }>(null);
+  const menuHostRef = useRef<MenuHostHandle>(null);
 
   const { scrollElRef, rows, virtualizer, totalSize, showJump, jumpToBottom, loadOlderIfNeeded } =
     useMessageListVirtualization({ ts, meId, openKey, loadOlder: requestOlder });
+
+  const freshIds = useFreshMessages(ts);
+  const { bursts, triggerOwn: triggerSuperBurst } = useSuperBursts(ts, meId);
+  const deleteFlow = useDeleteFlow(ts);
 
   // The row the last reply-click landed on: it flashes so the jumped-to message
   // is obvious once the smooth scroll settles. The class has to come off again
@@ -145,11 +144,10 @@ export default function MessageList({ onPreview, onShare }: Props) {
   const onDoubleClickMsg = useCallback(
     (row: MsgRow) => {
       if (!ts || openKey?.startsWith("user:")) return;
-      const emoji = state.reactionEmojis[0];
-      if (!emoji) return;
-      handleReaction(row.msg, emoji);
+      // IG's double-tap always reacts with the heart, regardless of the tray.
+      handleReaction(row.msg, "❤️");
     },
-    [ts, openKey, state.reactionEmojis, handleReaction],
+    [ts, openKey, handleReaction],
   );
 
   const onReplyClick = useCallback(
@@ -257,6 +255,9 @@ export default function MessageList({ onPreview, onShare }: Props) {
                   <MessageRow
                     row={row}
                     highlight={row.key === flashId}
+                    fresh={freshIds.has(row.key)}
+                    removing={deleteFlow.removingId === row.key}
+                    burst={bursts[row.key] ?? null}
                     onMedia={onMedia}
                     onMenu={onMenuRow}
                     onReplyClick={onReplyClick}
@@ -269,7 +270,12 @@ export default function MessageList({ onPreview, onShare }: Props) {
         )}
       </div>
 
-      <MenuHost ref={menuHostRef} />
+      <MenuHost
+        ref={menuHostRef}
+        onEdit={onEdit}
+        onDelete={deleteFlow.open}
+        onSuperReact={triggerSuperBurst}
+      />
 
       {showJump && (
         <button
@@ -280,99 +286,14 @@ export default function MessageList({ onPreview, onShare }: Props) {
           ↓
         </button>
       )}
+
+      <DeleteSheet
+        msg={deleteFlow.target}
+        own={deleteFlow.target !== null && deleteFlow.target.user_id === meId}
+        pending={deleteFlow.pending}
+        onConfirm={deleteFlow.confirm}
+        onClose={deleteFlow.close}
+      />
     </div>
-  );
-}
-
-const MenuHost = forwardRef<{ open: (x: number, y: number, msg: DirectMessage) => void }>(
-  function MenuHost(_, ref) {
-    const [menu, setMenu] = useState<{ x: number; y: number; msg: DirectMessage } | null>(null);
-
-    useImperativeHandle(
-      ref,
-      () => ({
-        open: (x: number, y: number, msg: DirectMessage) => setMenu({ x, y, msg }),
-      }),
-      [],
-    );
-
-    if (!menu) return null;
-    return <MessageMenu menu={menu} onClose={() => setMenu(null)} />;
-  },
-);
-
-function MessageMenu({
-  menu,
-  onClose,
-}: {
-  menu: { x: number; y: number; msg: DirectMessage };
-  onClose: () => void;
-}) {
-  const { state, updateThread, setReply, sendReaction } = useApp();
-  const openKey = state.openKey;
-  const ts = openKey ? state.threads[openKey] : undefined;
-  const msg = menu.msg;
-
-  const react = useCallback(
-    (emoji: string) => {
-      if (!ts || openKey?.startsWith("user:")) {
-        onClose();
-        return;
-      }
-      const { reactions, del } = toggleReaction(msg, emoji, state.me.user_id);
-      updateThread(ts.key, (t) => threadWithReaction(t, msg.id, reactions));
-      sendReaction(ts.key, msg.id, emoji, del);
-      onClose();
-    },
-    [ts, openKey, msg, state.me.user_id, updateThread, sendReaction, onClose],
-  );
-
-  const doReply = useCallback(() => {
-    if (!ts) return;
-    const sender = senderOf(ts, msg, state.me.user_id);
-    const text = (msg.text ?? "").slice(0, 60);
-    setReply({
-      threadKey: ts.key,
-      msgId: msg.id,
-      clientContext: msg.client_context ?? null,
-      preview: sender.length > 0 ? `${sender}: ${text}` : text,
-    });
-    onClose();
-  }, [ts, msg, state.me.user_id, setReply, onClose]);
-
-  const doCopyText = useCallback(() => {
-    if (msg.text) {
-      void copyClipboard(msg.text);
-      toast("Message text copied");
-    }
-    onClose();
-  }, [msg.text, onClose]);
-
-  const doCopyRaw = useCallback(() => {
-    const raw = msg.raw ? JSON.stringify(msg.raw, null, 2) : JSON.stringify(msg, null, 2);
-    void copyClipboard(raw);
-    toast("Raw message data copied");
-    onClose();
-  }, [msg, onClose]);
-
-  if (!ts) return null;
-
-  return (
-    <ContextMenu x={menu.x} y={menu.y} onClose={onClose}>
-      <div className="flex items-center justify-center gap-0.5 px-2 py-1.5">
-        {state.reactionEmojis.map((emoji) => (
-          <button
-            key={emoji}
-            className="emoji-font rounded-md p-1 text-[18px] text-ink transition-colors duration-150 hover:bg-black/10 dark:hover:bg-white/10"
-            onClick={() => react(emoji)}
-          >
-            {emojiDisplay(emoji)}
-          </button>
-        ))}
-      </div>
-      <MenuItem label="Reply" onSelect={doReply} />
-      <MenuItem label="Copy text" onSelect={doCopyText} />
-      <MenuItem label="Copy raw data" onSelect={doCopyRaw} />
-    </ContextMenu>
   );
 }

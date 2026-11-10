@@ -10,6 +10,7 @@ import {
   useRef,
   useState,
   type ReactNode,
+  type RefObject,
 } from "react";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
@@ -62,8 +63,29 @@ interface AppContextValue {
   sendPhotoBytes: (threadId: string, data: Uint8Array, ext: string) => void;
   sendVideo: (threadId: string, path: string) => void;
   sendVoice: (threadId: string, data: Uint8Array, ext: string) => void;
-  sendReaction: (threadId: string, messageId: string, emoji: string, del: boolean) => void;
+  sendReaction: (
+    threadId: string,
+    messageId: string,
+    emoji: string,
+    del: boolean,
+    superReactType?: string | null,
+    clientContext?: string | null,
+  ) => void;
   markSeen: (threadId: string, itemId: string, raw?: Json) => void;
+  /** Ask the backend to mark the thread's newest message as seen. */
+  markThreadSeen: (threadId: string) => void;
+  editMessage: (
+    threadId: string,
+    messageId: string,
+    text: string,
+    clientContext?: string | null,
+  ) => void;
+  deleteMessage: (
+    threadId: string,
+    messageId: string,
+    clientContext: string | null,
+    forSelf: boolean,
+  ) => void;
   sendTyping: (threadId: string, active: boolean) => void;
   downloadMedia: (url: string) => void;
   // local UI state mutations
@@ -121,54 +143,14 @@ async function notifyMessage(title: string, body: string): Promise<void> {
   }
 }
 
-// Identity-stable actions: pure `api.*` passthroughs need no component state,
-// so they live at module level and keep a constant identity across renders.
-const provideCode = (code: string) => api.provideCode(code);
-const cancelCode = () => api.cancelCode();
-const logout = () => api.logout();
-const loadMessages = (threadId: string, amount = 30) => api.loadMessages(threadId, amount);
-const loadOlder = (threadId: string, cursor: string) => api.loadOlder(threadId, cursor);
-const threadDetails = (threadId: string) => api.threadDetails(threadId);
-const threadRaw = (threadId: string) => api.threadRaw(threadId);
-const approveRequest = (threadId: string) => api.approveRequest(threadId);
-const searchUsers = (query: string) => api.searchUsers(query);
-const threadForUser = (user: UserShort) => api.threadForUser(user);
-const sendPhoto = (threadId: string, path: string) => {
-  api.sendPhoto(threadId, path).catch((e) => toast(`Send failed: ${e}`));
-};
-const sendPhotoBytes = (threadId: string, data: Uint8Array, ext: string) => {
-  api.sendPhotoBytes(threadId, data, ext).catch((e) => toast(`Send failed: ${e}`));
-};
-const sendVideo = (threadId: string, path: string) => {
-  api.sendVideo(threadId, path).catch((e) => toast(`Send failed: ${e}`));
-};
-const sendVoice = (threadId: string, data: Uint8Array, ext: string) => {
-  api.sendVoice(threadId, data, ext).catch((e) => toast(`Send failed: ${e}`));
-};
-const sendReaction = (threadId: string, messageId: string, emoji: string, del: boolean) =>
-  api.sendReaction(threadId, messageId, emoji, del);
-const markSeen = (threadId: string, itemId: string, raw?: Json) =>
-  api.markSeen(threadId, itemId, raw);
-const sendTyping = (threadId: string, active: boolean) => api.sendTyping(threadId, active);
-const downloadMedia = (url: string) => api.downloadMedia(url);
-
-export function AppProvider({ children }: { children: ReactNode }) {
-  const [state, setState] = useState<AppState>(defaultAppState);
-  // `stateRef` is the authoritative state; React state mirrors it. Both the
-  // UI mutations below and the backend-event handler in the subscription
-  // effect advance the ref *before* committing, so an event that arrives in
-  // the same tick as a user action (a click that opens a thread while
-  // `ThreadsLoaded` lands) reduces against the state that action produced
-  // instead of the previous render's — which used to silently discard the
-  // action, since the event handler committed an absolute value.
-  const stateRef = useRef(state);
-  const mutate = useCallback((fn: (s: AppState) => AppState) => {
-    const next = fn(stateRef.current);
-    stateRef.current = next;
-    setState(next);
-  }, []);
-  // React StrictMode dev re-runs the bootstrap effect; the guard keeps the
-  // launch resume (a live login) from firing twice.
+/** Backend event subscription, bootstrap load, and Settings-window broadcasts. */
+function useBackendEvents(
+  stateRef: RefObject<AppState>,
+  mutate: (fn: (s: AppState) => AppState) => void,
+  resumeSession: (name: string) => void,
+) {
+  // React StrictMode dev re-runs the effect; the guard keeps the launch resume
+  // (a live login) from firing twice.
   const autoLoginRef = useRef(false);
 
   // Subscribe to backend events first so no event — notably the `LoggedIn`
@@ -185,7 +167,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       if (event.type === "LoggedOut") clearImageCache();
       const result = applyEvent(stateRef.current, event);
       stateRef.current = result.state;
-      setState(result.state);
+      mutate(() => result.state);
       for (const effect of result.effects) {
         runEffect(effect);
       }
@@ -218,7 +200,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
             if (last) {
               if (!autoLoginRef.current) {
                 autoLoginRef.current = true;
-                loginSaved(last);
+                resumeSession(last);
               }
             } else {
               mutate((s) => ({ ...s, screen: "login" }));
@@ -261,7 +243,100 @@ export function AppProvider({ children }: { children: ReactNode }) {
       unlistenTheme?.();
       unlistenChatThemes?.();
     };
+  }, [mutate, resumeSession, stateRef]);
+}
+
+/** Coming back to the app with a chat open: mark its newest message seen again
+ * (receipts may have been sent while the window was in the background). */
+function useMarkSeenOnFocus(stateRef: RefObject<AppState>) {
+  useEffect(() => {
+    const onFocus = () => {
+      const s = stateRef.current;
+      const key = s.openKey;
+      if (s.screen !== "main" || !key || key.startsWith("user:")) return;
+      api.markThreadSeen(key);
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [stateRef]);
+}
+
+// Identity-stable actions: pure `api.*` passthroughs need no component state,
+// so they live at module level and keep a constant identity across renders.
+const provideCode = (code: string) => api.provideCode(code);
+const cancelCode = () => api.cancelCode();
+const logout = () => api.logout();
+const loadMessages = (threadId: string, amount = 30) => api.loadMessages(threadId, amount);
+const loadOlder = (threadId: string, cursor: string) => api.loadOlder(threadId, cursor);
+const threadDetails = (threadId: string) => api.threadDetails(threadId);
+const threadRaw = (threadId: string) => api.threadRaw(threadId);
+const approveRequest = (threadId: string) => api.approveRequest(threadId);
+const searchUsers = (query: string) => api.searchUsers(query);
+const threadForUser = (user: UserShort) => api.threadForUser(user);
+const sendPhoto = (threadId: string, path: string) => {
+  api.sendPhoto(threadId, path).catch((e) => toast(`Send failed: ${e}`));
+};
+const sendPhotoBytes = (threadId: string, data: Uint8Array, ext: string) => {
+  api.sendPhotoBytes(threadId, data, ext).catch((e) => toast(`Send failed: ${e}`));
+};
+const sendVideo = (threadId: string, path: string) => {
+  api.sendVideo(threadId, path).catch((e) => toast(`Send failed: ${e}`));
+};
+const sendVoice = (threadId: string, data: Uint8Array, ext: string) => {
+  api.sendVoice(threadId, data, ext).catch((e) => toast(`Send failed: ${e}`));
+};
+const sendReaction = (
+  threadId: string,
+  messageId: string,
+  emoji: string,
+  del: boolean,
+  superReactType?: string | null,
+  clientContext?: string | null,
+) => api.sendReaction(threadId, messageId, emoji, del, superReactType, clientContext);
+const markSeen = (threadId: string, itemId: string, raw?: Json) =>
+  api.markSeen(threadId, itemId, raw);
+const markThreadSeen = (threadId: string) => api.markThreadSeen(threadId);
+const editMessage = (
+  threadId: string,
+  messageId: string,
+  text: string,
+  clientContext?: string | null,
+) => api.editMessage(threadId, messageId, text, clientContext);
+const deleteMessage = (
+  threadId: string,
+  messageId: string,
+  clientContext: string | null,
+  forSelf: boolean,
+) => api.deleteMessage(threadId, messageId, clientContext, forSelf);
+const sendTyping = (threadId: string, active: boolean) => api.sendTyping(threadId, active);
+const downloadMedia = (url: string) => api.downloadMedia(url);
+
+export function AppProvider({ children }: { children: ReactNode }) {
+  const [state, setState] = useState<AppState>(defaultAppState);
+  // `stateRef` is the authoritative state; React state mirrors it. Both the
+  // UI mutations below and the backend-event handler in the subscription
+  // effect advance the ref *before* committing, so an event that arrives in
+  // the same tick as a user action (a click that opens a thread while
+  // `ThreadsLoaded` lands) reduces against the state that action produced
+  // instead of the previous render's — which used to silently discard the
+  // action, since the event handler committed an absolute value.
+  const stateRef = useRef(state);
+  const mutate = useCallback((fn: (s: AppState) => AppState) => {
+    const next = fn(stateRef.current);
+    stateRef.current = next;
+    setState(next);
   }, []);
+  // `busy` is set here and cleared only by the reducer (LoggedIn/LoginError/CodePrompt).
+  const loginSaved = useCallback((name: string) => {
+    mutate((s) => ({
+      ...s,
+      login: { ...s.login, busy: true, error: "", pendingSession: name },
+    }));
+    api.loginSaved(name);
+  }, []);
+
+  useBackendEvents(stateRef, mutate, loginSaved);
+  useMarkSeenOnFocus(stateRef);
 
   const setSearch = useCallback((query: string) => {
     mutate((s) => ({
@@ -292,6 +367,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   const refreshInbox = useCallback(() => {
     mutate((s) => ({ ...s, inboxLoading: true }));
+    // A refresh is a good moment to re-acknowledge the chat on screen; the
+    // reducer's Seen handling keeps the receipt state in sync afterwards.
+    const openKey = stateRef.current.openKey;
+    if (openKey && !openKey.startsWith("user:")) api.markThreadSeen(openKey);
     api.refreshInbox();
   }, []);
 
@@ -304,14 +383,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const loginSessionid = useCallback((sessionid: string) => {
     mutate((s) => ({ ...s, login: { ...s.login, busy: true, error: "" } }));
     api.loginSessionid(sessionid);
-  }, []);
-
-  const loginSaved = useCallback((name: string) => {
-    mutate((s) => ({
-      ...s,
-      login: { ...s.login, busy: true, error: "", pendingSession: name },
-    }));
-    api.loginSaved(name);
   }, []);
 
   const saveReactionEmojis = useCallback((emojis: string[]) => {
@@ -409,6 +480,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
       sendVoice,
       sendReaction,
       markSeen,
+      markThreadSeen,
+      editMessage,
+      deleteMessage,
       sendTyping,
       downloadMedia,
       setSearch,

@@ -167,6 +167,15 @@ function upsertThread(state: AppState, thread: DirectThread, meta?: ThreadMeta):
   // the list (with its clock running backwards); its badge verdict is just as
   // stale, so the local one is kept instead.
   const stale = incomingActivity < existing.last_activity;
+  // `last_seen_at` carries both the receipt timestamp and the newest item each
+  // participant has seen: keep the raw item ids (seen-receipt bubbles) next to
+  // the epoch-second timestamps (unread heuristic / header).
+  const seenBy: Record<string, string> = {};
+  const lastSeenAt: Record<string, number> = {};
+  for (const [uid, info] of Object.entries(thread.last_seen_at)) {
+    if (info.item_id) seenBy[uid] = info.item_id;
+    lastSeenAt[uid] = info.timestamp ? new Date(info.timestamp).getTime() / 1000 : 0;
+  }
   let ts: ThreadState = {
     ...existing,
     title: threadTitleFrom(thread),
@@ -179,12 +188,8 @@ function upsertThread(state: AppState, thread: DirectThread, meta?: ThreadMeta):
     // thread unread and a payload without the field must not undo that.
     has_newer: stale ? existing.has_newer : (thread.has_newer ?? existing.has_newer),
     theme_data: thread.theme_data ?? null,
-    last_seen_at: Object.fromEntries(
-      Object.entries(thread.last_seen_at).map(([uid, info]) => [
-        uid,
-        info.timestamp ? new Date(info.timestamp).getTime() / 1000 : 0,
-      ]),
-    ),
+    seen_by: seenBy,
+    last_seen_at: lastSeenAt,
   };
   if (meta) {
     ts = { ...ts, nicknames: meta.nicknames, avatar: meta.avatar };
@@ -247,6 +252,7 @@ export function applyEvent(state: AppState, event: AppEvent): ReducerResult {
           screen: "login",
           threads: {},
           threadRaw: {},
+          presence: {},
           openKey: null,
           connected: false,
           statusDetail: "",
@@ -425,6 +431,44 @@ export function applyEvent(state: AppState, event: AppEvent): ReducerResult {
           seen_by: { ...ts.seen_by, [userId]: itemId },
           // The read receipt just arrived: the sender has seen up to now.
           last_seen_at: { ...ts.last_seen_at, [userId]: Math.floor(Date.now() / 1000) },
+        })),
+        effects,
+      };
+    }
+
+    case "Presence": {
+      const presence = { ...state.presence };
+      for (const entry of event.entries) {
+        // `at` is when this client learned the value: the backend re-polls
+        // every minute, so an entry older than a couple of polls is stale.
+        // (The server's `last_active_ms` is not used as a clock here: units
+        // and clock skew would hide genuinely active users.)
+        presence[entry.user_id] = { active: entry.is_active, at: Date.now() };
+      }
+      return { state: { ...state, presence }, effects };
+    }
+
+    case "MessageEdited": {
+      const { threadId, itemId, text } = event;
+      if (!state.threads[threadId]) return { state, effects };
+      return {
+        state: withThread(state, threadId, (ts) => ({
+          ...ts,
+          messages: ts.messages.map((m) => (m.id === itemId ? { ...m, text, is_edited: true } : m)),
+        })),
+        effects,
+      };
+    }
+
+    case "MessageDeleted": {
+      const { threadId, itemId } = event;
+      if (!state.threads[threadId]) return { state, effects };
+      return {
+        state: withThread(state, threadId, (ts) => ({
+          ...ts,
+          messages: ts.messages.filter((m) => m.id !== itemId),
+          // A deleted message must not linger as someone's read receipt.
+          seen_by: Object.fromEntries(Object.entries(ts.seen_by).filter(([, id]) => id !== itemId)),
         })),
         effects,
       };

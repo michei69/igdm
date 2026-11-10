@@ -132,6 +132,12 @@ export interface DirectMessage {
   xma_reel_mention?: XmaItem[] | null;
   action_log?: ActionLog | null;
   client_context?: string | null;
+  /** True when the sender edited this message after sending it. */
+  is_edited?: boolean | null;
+  /** Edited text/timestamp fields the server returns alongside the item. */
+  edit_text?: string | null;
+  /** True when the item was deleted/unsent (for everyone or the viewer). */
+  is_deleted?: boolean | null;
   raw?: Json;
 }
 
@@ -141,6 +147,14 @@ export interface LastSeenInfo {
   created_at?: string | null;
   shh_seen_state?: unknown;
   disappearing_messages_seen_state?: unknown;
+}
+
+/** One user's live presence entry (`user_presence` from the presence feed). */
+export interface PresenceEntry {
+  user_id: string;
+  is_active: boolean;
+  /** Last activity, epoch ms (omitted when the payload carries no timestamp). */
+  last_active_ms?: number | null;
 }
 
 export interface DirectThread {
@@ -252,6 +266,9 @@ export type AppEvent =
   | { type: "LiveMessage"; live: LiveMessage }
   | { type: "Typing"; threadId: string; senderId: string; active: boolean }
   | { type: "Seen"; threadId: string; userId: string; itemId: string }
+  | { type: "Presence"; entries: PresenceEntry[] }
+  | { type: "MessageEdited"; threadId: string; itemId: string; text: string }
+  | { type: "MessageDeleted"; threadId: string; itemId: string }
   | { type: "ThreadsLoaded"; threads: DirectThread[]; meta: Record<string, ThreadMeta> }
   | { type: "ThreadDetails"; threadId: string; thread: DirectThread; meta: ThreadMeta }
   | {
@@ -448,6 +465,8 @@ export interface AppState {
   screen: "booting" | "login" | "main";
   login: LoginState;
   me: MeInfo;
+  /** user_id -> live presence (`active` = "Active now", `at` = epoch ms). */
+  presence: Record<string, { active: boolean; at: number }>;
   threads: Record<string, ThreadState>;
   openKey: string | null;
   searchQuery: string;
@@ -481,6 +500,7 @@ export function defaultAppState(): AppState {
     screen: "booting",
     login: { ...DEFAULT_LOGIN_STATE },
     me: { username: "", user_id: "", profile_pic_url: "" },
+    presence: {},
     threads: {},
     openKey: null,
     searchQuery: "",

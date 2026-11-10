@@ -26,6 +26,13 @@ export default function ContextMenu({ x, y, onClose, children }: Props) {
   useEffect(() => {
     onCloseRef.current = onClose;
   });
+  // Focus the first item so the menu is usable without a mouse; arrows move
+  // between the item buttons and Escape closes (handled on the menu element).
+  useEffect(() => {
+    const el = menuRef.current;
+    el?.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus();
+  }, []);
+
   useEffect(() => {
     const close = () => onCloseRef.current();
     const onKey = (e: KeyboardEvent) => {
@@ -46,12 +53,38 @@ export default function ContextMenu({ x, y, onClose, children }: Props) {
   return (
     <div
       ref={menuRef}
+      role="menu"
       className="fixed z-40 flex min-w-[180px] flex-col rounded-lg border border-border bg-elevated p-1 shadow-2xl"
       style={{ left: x, top: y }}
       onMouseDown={(e) => e.stopPropagation()}
       onContextMenu={(e) => {
         e.preventDefault();
         e.stopPropagation();
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "Escape") {
+          e.stopPropagation();
+          onCloseRef.current();
+          return;
+        }
+        if (e.key !== "ArrowDown" && e.key !== "ArrowUp" && e.key !== "Home" && e.key !== "End") {
+          return;
+        }
+        e.preventDefault();
+        const items = Array.from(
+          e.currentTarget.querySelectorAll<HTMLButtonElement>("button:not(:disabled)"),
+        );
+        if (items.length === 0) return;
+        const focused = document.activeElement;
+        const current = focused instanceof HTMLButtonElement ? items.indexOf(focused) : -1;
+        const offset = e.key === "ArrowDown" ? 1 : -1;
+        const index =
+          e.key === "Home"
+            ? 0
+            : e.key === "End"
+              ? items.length - 1
+              : (Math.max(current, 0) + offset + items.length) % items.length;
+        items[index]?.focus();
       }}
     >
       {children}
@@ -72,6 +105,8 @@ export function MenuItem({
 }) {
   return (
     <button
+      type="button"
+      role="menuitem"
       className={`w-full rounded-md px-3 py-1.5 text-left text-[12px] transition-colors duration-150 hover:bg-black/10 dark:hover:bg-white/10 ${
         danger ? "text-danger" : "text-ink2"
       } ${disabled ? "opacity-50" : ""}`}

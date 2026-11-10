@@ -5,11 +5,13 @@ import Avatar from "../common/Avatar";
 interface Props {
   view: ThreadView;
   selected: boolean;
+  /** 1:1 thread whose other participant is active now (green dot). */
+  active: boolean;
   onPress: (key: string) => void;
   onSecondary?: (key: string, x: number, y: number) => void;
 }
 
-function ThreadRow({ view, selected, onPress, onSecondary }: Props) {
+function ThreadRow({ view, selected, active, onPress, onSecondary }: Props) {
   return (
     <button
       type="button"
@@ -22,8 +24,14 @@ function ThreadRow({ view, selected, onPress, onSecondary }: Props) {
         e.stopPropagation();
         onSecondary?.(view.key, e.clientX, e.clientY);
       }}
+      title={active ? "Active now" : undefined}
     >
-      <Avatar name={view.avatarName} url={view.avatarUrl} size={48} />
+      <Avatar
+        name={view.avatarName}
+        url={view.avatarUrl}
+        size={48}
+        presence={active ? "dot" : undefined}
+      />
       <div className="flex min-w-0 flex-1 flex-col gap-[3px]">
         <div className="flex w-full items-center justify-between gap-2">
           <span className="truncate text-[13.5px] font-semibold text-ink">{view.title}</span>

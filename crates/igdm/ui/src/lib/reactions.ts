@@ -11,11 +11,15 @@ export interface ReactionToggle {
   del: boolean;
 }
 
+/** Wire value IG expects for an animated "super" reaction (`X.0b7W`). */
+export const SUPER_REACT_TYPE = "BASIC_SUPER_REACT_ANIMATION";
+
 /** New reactions list when `viewerId` toggles `emoji` on `msg`. */
 export function toggleReaction(
   msg: DirectMessage,
   emoji: string,
   viewerId: string,
+  superReactType = "none",
 ): ReactionToggle {
   const plain = plainEmoji(emoji);
   const existing =
@@ -40,7 +44,7 @@ export function toggleReaction(
             client_context: null,
             sender_id: Number(viewerId) || 0,
             emoji,
-            super_react_type: "none",
+            super_react_type: superReactType,
           },
         ],
       };
@@ -123,12 +127,25 @@ export function applyReaction(
   return messages.map((m) => {
     if (!matchesMessage(m, reaction.messageId)) return m;
     const base = m.reactions ?? { likes: [], likes_count: 0, emojis: [] };
-    const dup = base.emojis.some(
+    const dup = base.emojis.find(
       (r) =>
         String(r.sender_id) === reaction.senderId &&
         plainEmoji(r.emoji) === plainEmoji(reaction.emoji),
     );
-    if (dup) return m;
+    if (dup) {
+      // Same reaction re-sent as a super react: upgrade the pill instead of
+      // dropping the patch (that is what makes the animation/glow trigger).
+      if (dup.super_react_type === reaction.superReactType) return m;
+      return {
+        ...m,
+        reactions: {
+          ...base,
+          emojis: base.emojis.map((r) =>
+            r === dup ? { ...r, super_react_type: reaction.superReactType } : r,
+          ),
+        },
+      };
+    }
     return {
       ...m,
       reactions: {

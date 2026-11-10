@@ -1,11 +1,11 @@
 // Pure row-model builder for the virtualized message list.
 
 import type { DirectMessage, ThreadState, UserShort } from "../state";
-import { displayName } from "../state";
+import { displayName, tsMillis } from "../state";
 import { attachmentFromMsg, type Attachment, type AuthorResolver } from "./attachment";
 import { mediaLabel, messagePreview, reactionDetails, reactionsText } from "./format";
 import { type Json, type JsonObject } from "./guards";
-import type { MessageView } from "../components/chat/MessageRow";
+import type { MessageView, SeenAvatar } from "../components/chat/MessageRow";
 
 export type MsgRow = {
   kind: "msg";
@@ -19,6 +19,9 @@ export type Row =
   | { kind: "hint"; key: string; loading: boolean }
   | { kind: "day"; key: string; when: Date }
   | MsgRow;
+
+/** Shared empty receipt list: most rows have no seen stack. */
+const EMPTY_SEEN: SeenAvatar[] = [];
 
 /** Display-name resolution shared by `senderOf` and reaction names. */
 function resolveName(
@@ -71,6 +74,9 @@ function systemView(
     system: description,
     systemIcon,
     replyTarget: null,
+    seenBy: EMPTY_SEEN,
+    hasSuperReaction: false,
+    edited: false,
   });
 }
 
@@ -155,17 +161,59 @@ export function buildRows(ts: ThreadState, meId: string): Row[] {
     const user = userMap.get(uid ?? "");
     return user ? { name: displayName(ts, user), url: user.profile_pic_url ?? null } : null;
   };
+  // Rows the server already flagged as deleted/unsent never render. The
+  // reducer drops them on `MessageDeleted`; this covers a payload that still
+  // carries the flag (e.g. a re-fetched history page).
+  const messages = ts.messages.some((m) => m.is_deleted)
+    ? ts.messages.filter((m) => !m.is_deleted)
+    : ts.messages;
+  // Seen receipts: only the newest own message any other participant has seen
+  // carries the mini-avatar stack (Instagram shows one stack per thread).
+  const indexById = new Map(messages.map((m, i) => [m.id, i]));
+  const participants = ts.users.filter((u) => u.pk !== meId);
+  const seenStackFor = (index: number, msg: DirectMessage): SeenAvatar[] => {
+    const seen: SeenAvatar[] = [];
+    const msgMs = tsMillis(msg);
+    for (const user of participants) {
+      const itemId = ts.seen_by[user.pk];
+      const seenIdx = itemId ? indexById.get(itemId) : undefined;
+      const seenById = seenIdx !== undefined && seenIdx >= index;
+      // `seen_by` is authoritative; the timestamp covers a receipt whose item
+      // id is not in the loaded page.
+      const seenByTime = (ts.last_seen_at[user.pk] ?? 0) * 1000 >= msgMs;
+      if (seenById || seenByTime) {
+        seen.push({
+          pk: user.pk,
+          name: displayName(ts, user),
+          url: user.profile_pic_url ?? null,
+        });
+      }
+    }
+    return seen;
+  };
+  let seenMessageId: string | null = null;
+  let seenStack: SeenAvatar[] = EMPTY_SEEN;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.user_id !== meId || m.item_type === "action_log" || callEventOf(m) !== null) continue;
+    const seen = seenStackFor(i, m);
+    if (seen.length > 0) {
+      seenMessageId = m.id;
+      seenStack = seen;
+      break;
+    }
+  }
   // Days whose only rows are action logs or call events (or reaction logs,
   // which are skipped entirely) get no date separator — a lone marker with
   // nothing under it is noise.
   const realDays = new Set<string>();
-  for (const m of ts.messages) {
+  for (const m of messages) {
     if (m.item_type !== "action_log" && callEventOf(m) === null) {
       realDays.add(cacheFor(m, resolveAuthor).dayKey);
     }
   }
   let prevDay = "";
-  for (const msg of ts.messages) {
+  for (const msg of messages) {
     const cached = cacheFor(msg, resolveAuthor);
     const day = cached.dayKey;
     if (day !== prevDay && realDays.has(day)) {
@@ -232,6 +280,11 @@ export function buildRows(ts: ThreadState, meId: string): Row[] {
         system: null,
         systemIcon: null,
         replyTarget,
+        seenBy: msg.id === seenMessageId ? seenStack : EMPTY_SEEN,
+        hasSuperReaction: (msg.reactions?.emojis ?? []).some(
+          (r) => (r.super_react_type ?? "none") !== "none",
+        ),
+        edited: msg.is_edited === true,
       }),
       msg,
       replyTarget,

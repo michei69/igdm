@@ -1,23 +1,49 @@
 import { useEffect, useMemo, useState } from "react";
 import { useApp } from "../../hooks/useApp";
-import { avatarForThread, threadTitle, tsMillis, type ThreadState } from "../../state";
+import {
+  avatarForThread,
+  displayName,
+  threadTitle,
+  tsMillis,
+  type ThreadState,
+  type UserShort,
+} from "../../state";
 import Avatar from "../common/Avatar";
+import { activeParticipants } from "../common/presence";
 
-/** Header subtitle: typing indicator, seen receipt, or member list. */
+type SubtitleTone = "typing" | "live" | "muted";
+
+interface Subtitle {
+  text: string;
+  tone: SubtitleTone;
+}
+
+/** Header subtitle precedence: typing > active now > seen > member list. */
 function subtitleFor(
   ts: ThreadState,
   typers: string[],
+  active: UserShort[],
   meId: string,
-): { text: string; className: string } | null {
+): Subtitle | null {
   if (typers.length === 1) {
     const name = ts.users.find((u) => u.pk === typers[0]);
     return {
       text: `${ts.nicknames[typers[0]] || name?.full_name || name?.username || "Someone"} typing…`,
-      className: "emphasis",
+      tone: "typing",
     };
   }
   if (typers.length > 1) {
-    return { text: `${typers.length} people typing…`, className: "emphasis" };
+    return { text: `${typers.length} people typing…`, tone: "typing" };
+  }
+  if (active.length > 0) {
+    if (!ts.is_group) return { text: "Active now", tone: "live" };
+    if (active.length <= 2) {
+      return {
+        text: `${active.map((u) => displayName(ts, u)).join(", ")} active`,
+        tone: "live",
+      };
+    }
+    return { text: `${active.length} active`, tone: "live" };
   }
   const last = ts.messages[ts.messages.length - 1];
   const ownLast = last && last.user_id === meId;
@@ -26,12 +52,12 @@ function subtitleFor(
     ownLast &&
     Object.entries(ts.last_seen_at).some(([uid, t]) => uid !== meId && t > 0 && t >= lastOwnTs);
   if (seenByOthers) {
-    return { text: "Seen", className: "text-ink3" };
+    return { text: "Seen", tone: "muted" };
   }
   if (ts.users.length > 0) {
     return {
       text: ts.users.map((u) => `@${u.username || "?"}`).join(", "),
-      className: "text-ink3",
+      tone: "muted",
     };
   }
   return null;
@@ -62,9 +88,15 @@ export default function ChatHeader() {
 
   if (!ts) return null;
 
-  const subtitle = subtitleFor(ts, typers, state.me.user_id);
-
+  const active = activeParticipants(state.presence, ts.users, state.me.user_id);
+  const subtitle = subtitleFor(ts, typers, active, state.me.user_id);
   const avatar = avatarForThread(ts);
+  const subtitleColor =
+    subtitle?.tone === "typing"
+      ? "var(--ct-emphasis, var(--color-accent))"
+      : subtitle?.tone === "live"
+        ? "var(--ig-live)"
+        : "var(--ct-header-subtitle)";
 
   return (
     <div
@@ -74,22 +106,24 @@ export default function ChatHeader() {
         borderColor: "var(--ct-separator)",
       }}
     >
-      <Avatar name={avatar.name} url={avatar.url} size={44} />
+      <Avatar
+        name={avatar.name}
+        url={avatar.url}
+        size={44}
+        presence={active.length > 0 ? "ring" : undefined}
+      />
       <div className="min-w-0 flex-1">
         <div className="truncate text-[14px] font-bold" style={{ color: "var(--ct-header-title)" }}>
           {threadTitle(ts)}
         </div>
         {subtitle && (
-          <div
-            className="truncate text-[11px]"
-            style={
-              subtitle.className === "emphasis"
-                ? { color: "var(--ct-emphasis, var(--color-accent))" }
-                : { color: "var(--ct-header-subtitle)" }
-            }
+          <span
+            key={`${subtitle.tone}:${subtitle.text}`}
+            className="subtitle-crossfade block truncate text-[11px]"
+            style={{ color: subtitleColor }}
           >
             {subtitle.text}
-          </div>
+          </span>
         )}
       </div>
     </div>
